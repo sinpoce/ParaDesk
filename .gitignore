@@ -1,0 +1,21 @@
+# Build output
+bin/
+obj/
+dist/
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+*.userprefs
+
+# NuGet
+packages/
+*.nupkg
+
+# Local settings that must never be published
+# (the app stores its real settings under %LOCALAPPDATA%\ParaDesk, not here —
+#  this is only a guard in case someone drops a copy into the tree)
+settings.json
+*.log

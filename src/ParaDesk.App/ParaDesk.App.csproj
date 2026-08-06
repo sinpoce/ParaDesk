@@ -1,0 +1,64 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- M0/M1 保持 net48：运行时随系统自带，零下载依赖。M2 再评估迁 net8.0-windows。 -->
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <UseWindowsForms>true</UseWindowsForms>
+    <!-- 管理界面用 WPF（Fluent 外观、原生 Per-Monitor DPI）；
+         RDP 画面仍由独立的 WinForms 顶层窗口承载，两者不混排。 -->
+    <UseWPF>true</UseWPF>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>ParaDesk</RootNamespace>
+    <AssemblyName>ParaDesk</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>paradesk.ico</ApplicationIcon>
+    <Platforms>AnyCPU</Platforms>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <Product>ParaDesk</Product>
+    <AssemblyTitle>ParaDesk 分身桌面</AssemblyTitle>
+    <Company>ParaDesk</Company>
+    <Version>1.0.0</Version>
+    <NeutralLanguage>zh-CN</NeutralLanguage>
+    <SatelliteResourceLanguages>zh-CN;en</SatelliteResourceLanguages>
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 同一个 .ico 既做 exe 图标，也作为资源供 WPF 窗口引用 -->
+    <Resource Include="paradesk.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.ServiceProcess" />
+    <!-- 诊断包打 zip -->
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
+    <Reference Include="System.Runtime.Serialization" />
+    <!-- DPAPI（ProtectedData）用于加密保存的登录凭据 -->
+    <Reference Include="System.Security" />
+    <!-- dynamic（RDP OCX 后期绑定）依赖 C# 运行时绑定器 -->
+    <Reference Include="Microsoft.CSharp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Fluent/Win11 外观库（PowerToys 同款）。同时支持 net4x 与现代 .NET，
+         M2 若迁到 .NET 9 也不用换库。 -->
+    <PackageReference Include="WPF-UI" Version="3.0.5" />
+    <!-- WinRT 投影所需的引用程序集：Windows.Graphics.Capture（录屏捕获）
+         与 Windows.Media.Transcoding（编码封装 MP4）。
+         .NET Framework 的 CLR 自带 WinRT 投影，这里只需引用程序集；
+         真正的可用性由操作系统版本决定，运行时用 ApiInformation 判定。 -->
+    <PackageReference Include="Microsoft.Windows.SDK.Contracts" Version="10.0.22621.2428" PrivateAssets="all" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <!-- 缺少绑定重定向会导致经典的
+         "Could not load file or assembly 'System.Runtime.WindowsRuntime'" 失败 -->
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
+  </PropertyGroup>
+
+</Project>

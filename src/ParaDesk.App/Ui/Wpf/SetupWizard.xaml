@@ -1,0 +1,120 @@
+<ui:FluentWindow
+    x:Class="ParaDesk.Shell.SetupWizard"
+    x:ClassModifier="internal"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+    xmlns:local="clr-namespace:ParaDesk.Shell"
+    Title="欢迎使用 ParaDesk"
+    Width="720" Height="600"
+    ResizeMode="NoResize"
+    WindowStartupLocation="CenterScreen"
+    WindowBackdropType="Mica"
+    ExtendsContentIntoTitleBar="True"
+    WindowCornerPreference="Round"
+    Icon="pack://application:,,,/paradesk.ico">
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <ui:TitleBar Grid.Row="0" Title="欢迎使用 ParaDesk" ShowMaximize="False">
+            <ui:TitleBar.Icon>
+                <ui:SymbolIcon Symbol="Desktop24"/>
+            </ui:TitleBar.Icon>
+        </ui:TitleBar>
+
+        <ScrollViewer Grid.Row="1" Margin="28,4,28,0" VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+
+                <!-- 第 1 步：介绍 -->
+                <StackPanel x:Name="Step1">
+                    <TextBlock Text="给你的电脑开一个分身" FontSize="26" FontWeight="SemiBold"/>
+                    <TextBlock Margin="0,10,0,0" TextWrapping="Wrap" Opacity="0.85" FontSize="14"
+                               Text="ParaDesk 会在你选定的显示器上开出第二个 Windows 桌面。它有自己独立的鼠标和键盘——AI 或另一个人在那边操作时，你主屏的键鼠完全不受影响。"/>
+                    <ui:Card Margin="0,18,0,0">
+                        <StackPanel>
+                            <TextBlock Text="它和虚拟机不一样" FontWeight="SemiBold" FontSize="15"/>
+                            <TextBlock Margin="0,8,0,0" TextWrapping="Wrap" Opacity="0.8"
+                                       Text="分身桌面用的是你同一个 Windows 账户：软件、文件、浏览器登录状态、AI 的记忆和工作进度全部通用，不需要来回传文件。代价是它不做安全隔离——那边能访问你所有文件，和你自己在主桌面操作的权限一样。"/>
+                        </StackPanel>
+                    </ui:Card>
+                    <ui:InfoBar Margin="0,14,0,0" IsOpen="True" Severity="Informational" IsClosable="False"
+                                Title="需要 Windows 专业版及以上"
+                                Message="家庭版不含子会话功能。第一次启动桌面时需要一次管理员授权，之后日常使用无需提权。"/>
+                </StackPanel>
+
+                <!-- 第 2 步：环境检查 -->
+                <!-- 环境检查与"要改什么"合成一步：配置本身已经不需要用户操作了，
+                     单独留一个"点这里配置"的步骤只是多一次点击 -->
+                <StackPanel x:Name="Step2" Visibility="Collapsed">
+                    <TextBlock Text="环境检查" FontSize="26" FontWeight="SemiBold"/>
+                    <TextBlock Margin="0,10,0,16" TextWrapping="Wrap" Opacity="0.85"
+                               Text="确认这台电脑具备运行条件。有未通过项也不用管——第一次点「启动桌面」时会自动配置好，只需一次管理员授权。"/>
+                    <StackPanel x:Name="CheckList"/>
+                    <ui:InfoBar x:Name="CheckBar" Margin="0,14,0,0" IsOpen="True"
+                                Severity="Informational" IsClosable="False" Title="" Message=""/>
+                    <ui:Card x:Name="SetupPlanCard" Margin="0,14,0,0">
+                        <StackPanel>
+                            <TextBlock Text="那一次授权会改什么" FontWeight="SemiBold"/>
+                            <TextBlock Margin="0,10,0,0" TextWrapping="Wrap" Opacity="0.8"
+                                       Text="• 启用 Windows 子会话功能&#10;• 启用远程桌面监听器（子会话的必要前置条件，走本机回环、不经过网络）&#10;• 开放对应的防火墙规则&#10;• 允许委派默认凭据，这样以后不必每次输入密码&#10;• 将远程桌面服务设为自动启动&#10;• 关掉跨设备恢复，并挡掉它在分身桌面里弹的系统错误框"/>
+                        </StackPanel>
+                    </ui:Card>
+                </StackPanel>
+
+                <!-- 第 3 步：选屏幕 -->
+                <StackPanel x:Name="Step3" Visibility="Collapsed">
+                    <TextBlock Text="选择显示位置" FontSize="26" FontWeight="SemiBold"/>
+                    <TextBlock Margin="0,10,0,16" TextWrapping="Wrap" Opacity="0.85"
+                               Text="点一下要让分身桌面出现的那块屏幕。分不清哪块是哪块时，点“识别屏幕”。"/>
+                    <ui:Card Padding="6">
+                        <local:MonitorLayoutView x:Name="LayoutView" Height="210"
+                                                 SelectionChanged="OnLayoutSelectionChanged"/>
+                    </ui:Card>
+                    <ui:Button Margin="0,10,0,0" HorizontalAlignment="Left"
+                               Icon="{ui:SymbolIcon NumberSymbol24}"
+                               Content="识别屏幕" Click="OnIdentify"/>
+                </StackPanel>
+
+                <!-- 第 4 步：完成 -->
+                <StackPanel x:Name="Step4" Visibility="Collapsed">
+                    <TextBlock Text="准备就绪" FontSize="26" FontWeight="SemiBold"/>
+                    <TextBlock Margin="0,10,0,16" TextWrapping="Wrap" Opacity="0.85"
+                               Text="接下来就可以启动分身桌面了。几个值得先知道的点："/>
+                    <ui:Card Margin="0,0,0,10">
+                        <StackPanel>
+                            <TextBlock Text="常用操作" FontWeight="SemiBold"/>
+                            <TextBlock Margin="0,8,0,0" TextWrapping="Wrap" Opacity="0.8"
+                                       Text="• Ctrl+Alt+D 显示 / 收起分身桌面&#10;• Ctrl+Alt+V 切换“仅查看”（锁住你的键鼠，防止误触）&#10;• Ctrl+Alt+R 开始 / 停止录制&#10;• 关闭主窗口只是收进托盘，程序继续在后台运行"/>
+                        </StackPanel>
+                    </ui:Card>
+                    <ui:Card>
+                        <StackPanel>
+                            <TextBlock Text="必须知道的几点限制" FontWeight="SemiBold"/>
+                            <TextBlock Margin="0,8,0,0" TextWrapping="Wrap" Opacity="0.8"
+                                       Text="• 系统同时只允许一个分身桌面，这是 Windows 的限制&#10;• 剪贴板默认与主桌面共享；同一份浏览器配置不能两边同开，可在“显示”页一键生成独立配置的快捷方式&#10;• 重启电脑前请先“关闭桌面”"/>
+                        </StackPanel>
+                    </ui:Card>
+                </StackPanel>
+
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- 底部导航 -->
+        <Border Grid.Row="2" Padding="28,16,28,20">
+            <Grid>
+                <TextBlock x:Name="StepLabel" VerticalAlignment="Center" Opacity="0.6"/>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <ui:Button x:Name="BtnSkip" Content="跳过" Click="OnSkip" Margin="0,0,8,0"/>
+                    <ui:Button x:Name="BtnBack" Content="上一步" Click="OnBack" Margin="0,0,8,0"/>
+                    <ui:Button x:Name="BtnNext" Content="下一步" Appearance="Primary"
+                               MinWidth="110" Click="OnNext"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+</ui:FluentWindow>

@@ -6,12 +6,17 @@
     .\publish.ps1                 # 打包 Release 版到 dist\
     .\publish.ps1 -Version 1.1.0  # 指定版本号
 
-  说明：本脚本只做“绿色版 zip”。安装器与自动更新（Velopack）需要联网拉取
-  工具链，等确定分发渠道后再接；那之前 zip 已足够分发给测试用户。
+  产出两份：
+    dist\ParaDesk-<ver>.zip          绿色版，解压即用
+    dist\ParaDesk-<ver>-Setup.exe    安装包（需要 Inno Setup，缺了就只出 zip）
+
+  自动更新（Velopack）等确定分发渠道后再接。
 #>
 [CmdletBinding()]
 param(
-    [string]$Version = ''
+    [string]$Version = '',
+    # 只想快速出 zip 时用
+    [switch]$NoInstaller
 )
 
 $ErrorActionPreference = 'Stop'
@@ -75,7 +80,11 @@ ParaDesk 分身桌面  $ver
   Ctrl+Alt+V  切换“仅查看”
   Ctrl+Alt+R  开始 / 停止录制
 
-出问题时：主界面 →“设置”→“导出诊断包”，把生成的 zip 发给开发者。
+出问题时：主界面 →“诊断”→“查看日志”，或把
+%LOCALAPPDATA%\ParaDesk\paradesk.log 发给开发者。
+
+许可：PolyForm Noncommercial 1.0.0，非商业用途免费。
+      商业使用请联系 https://github.com/sinpoce/ParaDesk
 "@
 Set-Content -Path (Join-Path $stage '使用说明.txt') -Value $readme -Encoding UTF8
 
@@ -93,5 +102,54 @@ Write-Host "输出目录 : $stage" -ForegroundColor Green
 Write-Host "压缩包   : $zip" -ForegroundColor Green
 Write-Host ("大小     : {0:N2} MB" -f ((Get-Item $zip).Length / 1MB))
 Write-Host "SHA256   : $hash"
+
+# ---------------- 安装包 ----------------
+
+# ISCC 不装在固定位置：winget 装的、便携版、别的工具带的缓存副本都可能。
+# 优先挑带简体中文语言包的那份——Inno 6 默认不含 ChineseSimplified.isl。
+function Find-ISCC {
+    $candidates = @(
+        "$env:APPDATA\JackpotWorld\release_tools\cache\Inno7\ISCC.exe",
+        "$env:APPDATA\JackpotWorld\release_tools\cache\Inno\ISCC.exe",
+        "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe",
+        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+        "$env:ProgramFiles\Inno Setup 7\ISCC.exe",
+        "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+    )
+    foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
+    return $null
+}
+
+if ($NoInstaller) {
+    Write-Host ''
+    Write-Host '已跳过安装包（-NoInstaller）。' -ForegroundColor DarkGray
+}
+else {
+    $iscc = Find-ISCC
+    if (-not $iscc) {
+        Write-Host ''
+        Write-Warning '未找到 Inno Setup（ISCC.exe），只产出了 zip。'
+        Write-Host '  安装：winget install JRSoftware.InnoSetup.7' -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host ''
+        Write-Host "构建安装包 ... ($iscc)" -ForegroundColor Cyan
+        $iss = Join-Path $here 'installer\ParaDesk.iss'
+        & $iscc "/DAppVersion=$ver" "/DSourceDir=$stage" "/DOutputDir=$outRoot" $iss | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "安装包构建失败 ($LASTEXITCODE)" }
+
+        $setup = Join-Path $outRoot "ParaDesk-$ver-Setup.exe"
+        if (-not (Test-Path $setup)) { throw "找不到安装包产物: $setup" }
+
+        $setupHash = (Get-FileHash $setup -Algorithm SHA256).Hash
+        Set-Content -Path (Join-Path $outRoot "ParaDesk-$ver-Setup.sha256") `
+            -Value "$setupHash  ParaDesk-$ver-Setup.exe" -Encoding ASCII
+
+        Write-Host "安装包   : $setup" -ForegroundColor Green
+        Write-Host ("大小     : {0:N2} MB" -f ((Get-Item $setup).Length / 1MB))
+        Write-Host "SHA256   : $setupHash"
+    }
+}
+
 Write-Host ''
-Write-Host '提示：分发前应对 ParaDesk.exe 做代码签名，否则用户会看到 SmartScreen 警告。' -ForegroundColor Yellow
+Write-Host '提示：分发前应对 ParaDesk.exe 与安装包做代码签名，否则用户会看到 SmartScreen 警告。' -ForegroundColor Yellow

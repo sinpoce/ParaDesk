@@ -3,7 +3,7 @@
 **A second Windows desktop on your spare monitor — with its own mouse and keyboard, sharing your account and all your files.**
 
 [简体中文](#简体中文) · Windows 10 1903+ / Windows 11 · Pro edition or higher
-· Source-available under [PolyForm Noncommercial](LICENSE) — free for personal, research and nonprofit use
+· Open source under the [MIT License](LICENSE) — personal and commercial use welcome
 
 ![Desktop page](docs/images/desktop.png)
 
@@ -181,13 +181,13 @@ By contributing you agree that your contribution is licensed under the same term
 
 ## Licence
 
-**[PolyForm Noncommercial 1.0.0](LICENSE)** — the source is public, and you may read, modify and redistribute it **for any noncommercial purpose**.
+**[MIT License](LICENSE)** — ParaDesk is open source. You may use, copy, modify, merge, publish, distribute, sublicense and sell copies under the MIT terms.
 
-- ✅ Personal use, study, research, hobby projects
-- ✅ Charities, schools, public research, government institutions
-- ❌ Commercial use requires a separate licence from the author
-
-To be precise about wording: this is **source-available**, not OSI-approved "open source". If you want to use ParaDesk commercially, open an issue and we can talk.
+- ✅ Personal and commercial use
+- ✅ Modification and redistribution
+- ✅ Private use
+- ℹ️ Keep the copyright and licence notice with copies or substantial portions
+- ℹ️ Provided without warranty, as described in the licence
 
 ---
 ---
@@ -197,7 +197,7 @@ To be precise about wording: this is **source-available**, not OSI-approved "ope
 **在闲置的显示器上开出第二个 Windows 桌面 —— 拥有独立的鼠标键盘，同时共用你的账户与全部文件。**
 
 Windows 10 1903+ / Windows 11 · 需专业版及以上
-· 采用 [PolyForm Noncommercial](LICENSE) 许可 —— 个人、研究、非营利用途免费
+· 采用 [MIT License](LICENSE) 开源 —— 欢迎个人及商业用途
 
 ## 它解决什么问题
 
@@ -287,10 +287,9 @@ cd ParaDesk
 
 ## 许可证
 
-**[PolyForm Noncommercial 1.0.0](LICENSE)** —— 源码公开，**任何非商业用途**下都可自由阅读、修改、再分发。
+**[MIT License](LICENSE)** —— ParaDesk 是真正的开源软件，可依照 MIT 条款使用、复制、修改、合并、发布、分发、再许可及销售副本。
 
-- ✅ 个人使用、学习、研究、业余项目
-- ✅ 慈善机构、学校、公立研究机构、政府部门
-- ❌ 商业用途需另行向作者获得授权
-
-措辞上说清楚：这是**源码可见（source-available）**，不是 OSI 认证的「开源」。需要商业授权请开 issue 联系。
+- ✅ 允许个人及商业使用
+- ✅ 允许修改、再分发和私有使用
+- ℹ️ 复制或分发时需保留版权及许可声明
+- ℹ️ 软件按现状提供，不附带任何保证，详见许可证正文

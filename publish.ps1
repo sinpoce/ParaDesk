@@ -83,8 +83,8 @@ ParaDesk 分身桌面  $ver
 出问题时：主界面 →“诊断”→“查看日志”，或把
 %LOCALAPPDATA%\ParaDesk\paradesk.log 发给开发者。
 
-许可：PolyForm Noncommercial 1.0.0，非商业用途免费。
-      商业使用请联系 https://github.com/sinpoce/ParaDesk
+许可：MIT License。允许个人和商业使用、修改与再分发；
+      复制或分发时请保留版权及许可声明。
 "@
 Set-Content -Path (Join-Path $stage '使用说明.txt') -Value $readme -Encoding UTF8
 

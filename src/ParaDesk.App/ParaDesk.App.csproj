@@ -23,7 +23,7 @@
     <Product>ParaDesk</Product>
     <AssemblyTitle>ParaDesk 分身桌面</AssemblyTitle>
     <Company>ParaDesk</Company>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <NeutralLanguage>zh-CN</NeutralLanguage>
     <SatelliteResourceLanguages>zh-CN;en</SatelliteResourceLanguages>
     <DebugType>embedded</DebugType>

@@ -31,6 +31,8 @@ namespace ParaDesk.Recording
         /// <summary>已交付的总字节数，用于推算时间戳。</summary>
         private long _deliveredBytes;
 
+        private const int BacklogLimitSeconds = 3;
+
         public bool Enabled { get { return _useSystem || _useMic; } }
 
         public static int SampleRate { get { return WasapiCapture.SampleRate; } }
@@ -74,7 +76,7 @@ namespace ParaDesk.Recording
             }
 
             // 两路都失败才算失败；只挂掉一路就降级继续录另一路
-            if (!Enabled) return firstError ?? "音频设备不可用。";
+            if (!Enabled) return firstError ?? L.T("音频设备不可用。");
             return null;
         }
 
@@ -98,13 +100,9 @@ namespace ParaDesk.Recording
             }
         }
 
-        /// <summary>
-        /// 积压超过 3 秒就丢弃最旧的数据。供样端若因故落后，
-        /// 宁可丢掉一段旧声音，也不能让内存无限增长。
-        /// </summary>
         private static void TrimIfBacklogged(Queue<byte[]> q, ref int total, ref int offset)
         {
-            int limit = BytesPerSecond * 3;
+            int limit = BytesPerSecond * BacklogLimitSeconds;
             while (total > limit && q.Count > 0)
             {
                 var head = q.Dequeue();
@@ -198,33 +196,46 @@ namespace ParaDesk.Recording
             }
         }
 
-        /// <summary>任一路中途失败的原因；null 表示正常。</summary>
-        public string FailureReason
+        public void DiscardBuffered()
         {
-            get
-            {
-                if (_system != null && _system.FailureReason != null) return _system.FailureReason;
-                if (_mic != null && _mic.FailureReason != null) return _mic.FailureReason;
-                return null;
-            }
-        }
-
-        public void Stop()
-        {
-            if (_system != null) _system.Stop();
-            if (_mic != null) _mic.Stop();
-        }
-
-        public void Dispose()
-        {
-            if (_system != null) { _system.Dispose(); _system = null; }
-            if (_mic != null) { _mic.Dispose(); _mic = null; }
             lock (_sync)
             {
                 _systemQueue.Clear(); _micQueue.Clear();
                 _systemBytes = _micBytes = 0;
                 _systemOffset = _micOffset = 0;
             }
+        }
+
+        /// <summary>任一路中途失败的原因；null 表示正常。</summary>
+        public string FailureReason
+        {
+            get
+            {
+                var system = _system;
+                var mic = _mic;
+                if (system != null && system.FailureReason != null) return system.FailureReason;
+                if (mic != null && mic.FailureReason != null) return mic.FailureReason;
+                return null;
+            }
+        }
+
+        public void Stop()
+        {
+            var system = _system;
+            var mic = _mic;
+            if (system != null) system.Stop();
+            if (mic != null) mic.Stop();
+        }
+
+        public void Dispose()
+        {
+            var system = _system;
+            var mic = _mic;
+            _system = null;
+            _mic = null;
+            if (system != null) system.Dispose();
+            if (mic != null) mic.Dispose();
+            DiscardBuffered();
         }
     }
 }

@@ -14,11 +14,17 @@ namespace ParaDesk.Diagnostics
     /// </summary>
     internal static class ResourceDump
     {
+        private static void Say(string msg)
+        {
+            Console.WriteLine(msg);
+            Log.Info("[dumpres] " + msg);
+        }
+
         public static int Run()
         {
             if (!Shell.WpfHost.Initialize())
             {
-                Console.WriteLine("WPF 宿主初始化失败");
+                Say("WPF 宿主初始化失败");
                 return 1;
             }
 
@@ -43,9 +49,16 @@ namespace ParaDesk.Diagnostics
             string text = sb.ToString();
             Console.Write(text);
             string path = Path.Combine(Log.Dir, "resources.log");
-            try { File.WriteAllText(path, text, Encoding.UTF8); }
-            catch { }
-            Console.WriteLine("已写入 " + path);
+            try
+            {
+                File.WriteAllText(path, text, Encoding.UTF8);
+            }
+            catch (Exception ex)
+            {
+                Say("写入 " + path + " 失败: " + ex.Message);
+                return 1;
+            }
+            Say("已写入 " + path);
             return 0;
         }
 
@@ -56,7 +69,11 @@ namespace ParaDesk.Diagnostics
                 object v = Application.Current.TryFindResource(key);
                 return v == null ? "null" : v.GetType().Name;
             }
-            catch { return "?"; }
+            catch (Exception ex)
+            {
+                Log.Debug("[dumpres] 取资源 " + key + " 失败: " + ex.Message);
+                return "?";
+            }
         }
 
         private static void Collect(ResourceDictionary dict, List<string> into, int depth)
@@ -70,7 +87,10 @@ namespace ParaDesk.Diagnostics
                     if (s != null && !into.Contains(s)) into.Add(s);
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log.Debug("[dumpres] 枚举资源字典失败（深度 " + depth + "）: " + ex.Message);
+            }
 
             foreach (var child in dict.MergedDictionaries) Collect(child, into, depth + 1);
         }

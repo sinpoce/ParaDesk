@@ -72,7 +72,11 @@ namespace ParaDesk.Recording
                     return ApiInformation.IsPropertyPresent(
                         "Windows.Graphics.Capture.GraphicsCaptureSession", "IsBorderRequired");
                 }
-                catch { return false; }
+                catch (Exception ex)
+                {
+                    Log.Debug("检测捕获边框开关失败: " + ex.Message);
+                    return false;
+                }
             }
         }
 

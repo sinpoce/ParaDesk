@@ -1,51 +1,54 @@
 ﻿#Requires -Version 5.1
-<#
-  ParaDesk 构建脚本。
-  用法：
-    .\build.ps1              # Debug 构建
-    .\build.ps1 -Release     # Release 构建
-    .\build.ps1 -Run         # 构建后运行
-    .\build.ps1 -Probe       # 构建后跑只读环境自检
-#>
 [CmdletBinding()]
 param(
     [switch]$Release,
     [switch]$Run,
-    [switch]$Probe
+    [switch]$Probe,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
-$here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$proj = Join-Path $here 'src\ParaDesk.App\ParaDesk.App.csproj'
+. (Join-Path $PSScriptRoot 'scripts\common.ps1')
+
 $conf = if ($Release) { 'Release' } else { 'Debug' }
+$dotnet = Resolve-Dotnet
+$outDir = Get-ParaDeskOutputDir -Configuration $conf
+$exe = Get-ParaDeskExe -Configuration $conf
 
-# NuGet 缓存放 D 盘，避免撑爆系统盘
-if (-not $env:NUGET_PACKAGES) { $env:NUGET_PACKAGES = 'D:\DevCache\nuget' }
-
-$dotnet = 'C:\Program Files\dotnet\dotnet.exe'
-if (-not (Test-Path $dotnet)) { $dotnet = (Get-Command dotnet).Source }
-
-# 运行中的实例会锁住输出的 exe，先停掉再编译
-$running = Get-Process ParaDesk -ErrorAction SilentlyContinue
-if ($running) {
-    Write-Host "停止运行中的 ParaDesk ($($running.Id -join ', ')) ..." -ForegroundColor Yellow
-    $running | Stop-Process -Force
-    Start-Sleep -Milliseconds 800
-}
+Stop-ParaDeskIfRunning -OutputDir $outDir -Force:$Force
 
 Write-Host "构建 $conf ..." -ForegroundColor Cyan
-& $dotnet build $proj -c $conf -v minimal -nologo
+& $dotnet build $ParaDeskProject -c $conf -v minimal -nologo
 if ($LASTEXITCODE -ne 0) { throw "构建失败 (exit $LASTEXITCODE)" }
+if (-not (Test-Path -LiteralPath $exe)) { throw "构建成功但找不到产物: $exe" }
 
-$exe = Join-Path $here "src\ParaDesk.App\bin\$conf\net48\ParaDesk.exe"
 Write-Host "输出: $exe" -ForegroundColor Green
 
 if ($Probe) {
-    Write-Host "`n环境自检:" -ForegroundColor Cyan
-    & $exe --probe
-    Write-Host "`n(自检报告同时写入 $env:LOCALAPPDATA\ParaDesk\probe.log)"
+    Write-Host "`n环境自检 (--probe):" -ForegroundColor Cyan
+    $r = Invoke-ParaDeskExe -Exe $exe -ArgumentList @('--probe') -TimeoutSec 60
+    if ($r.Output) { Write-Host $r.Output.TrimEnd() }
+    if ($r.TimedOut) {
+        Write-Host '自检超时（60 秒）。' -ForegroundColor Red
+    }
+    elseif ($r.ExitCode -eq 0) {
+        Write-Host "`n就绪，可以启动分身桌面。(exit 0)" -ForegroundColor Green
+    }
+    elseif ($r.ExitCode -eq 2) {
+        Write-Host "`n环境未就绪，按上面的 NextAction 处理。(exit 2)" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "`n自检出错 (exit $($r.ExitCode))。" -ForegroundColor Red
+    }
+    Write-Host "(报告同时写入 $env:LOCALAPPDATA\ParaDesk\probe.log)" -ForegroundColor DarkGray
 }
 elseif ($Run) {
-    Start-Process $exe
+    $mySession = (Get-Process -Id $PID).SessionId
+    $others = @(Get-ParaDeskProcess | Where-Object { $_.Path -and $_.SessionId -eq $mySession })
+    if ($others.Count -gt 0) {
+        $msg = '另一个 ParaDesk 正在运行（{0}）。单实例机制下，新构建的程序启动后只会把它唤到前台；要运行新构建，请先从托盘菜单退出它。' -f $others[0].Path
+        Write-Warning $msg
+    }
+    Start-Process -FilePath $exe
     Write-Host "已启动。" -ForegroundColor Green
 }

@@ -16,6 +16,7 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>paradesk.ico</ApplicationIcon>
     <Platforms>AnyCPU</Platforms>
+    <Prefer32Bit>false</Prefer32Bit>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
     <Product>ParaDesk</Product>
     <AssemblyTitle>ParaDesk 分身桌面</AssemblyTitle>

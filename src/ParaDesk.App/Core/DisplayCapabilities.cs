@@ -21,13 +21,15 @@ namespace ParaDesk.Core
                 if (Width <= 0 || Height <= 0) return "";
                 int g = Gcd(Width, Height);
                 int w = Width / g, h = Height / g;
+                if (w == 8 && h == 5) return "16:10";
+                if (w == 7 && h == 3) return "21:9";
                 // 约简后过大的比例（如 683:384）对用户无意义，只标注常见值
                 if (w <= 32 && h <= 32) return w + ":" + h;
                 double r = (double)Width / Height;
                 if (Math.Abs(r - 16.0 / 9) < 0.01) return "16:9";
                 if (Math.Abs(r - 16.0 / 10) < 0.01) return "16:10";
                 if (Math.Abs(r - 4.0 / 3) < 0.01) return "4:3";
-                if (Math.Abs(r - 21.0 / 9) < 0.03) return "21:9";
+                if (Math.Abs(r - 21.0 / 9) < 0.06) return "21:9";
                 return "";
             }
         }
@@ -46,16 +48,49 @@ namespace ParaDesk.Core
         {
             return (Width * 397) ^ (Height * 31) ^ Frequency;
         }
+
+        internal DisplayMode Clone()
+        {
+            return new DisplayMode { Width = Width, Height = Height, Frequency = Frequency };
+        }
     }
 
-    /// <summary>
-    /// 枚举显示器真实支持的分辨率与刷新率。
-    /// 不再用写死的挡位——不同屏幕能力差别很大（有 60Hz 的也有 144Hz 的，
-    /// 有 16:9 也有 16:10），写死既可能给出屏幕做不到的选项，
-    /// 也会漏掉它本来支持的模式。
-    /// </summary>
     internal static class DisplayCapabilities
     {
+        private static readonly object CacheSync = new object();
+
+        private static readonly Dictionary<string, List<DisplayMode>> ModesCache =
+            new Dictionary<string, List<DisplayMode>>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly Dictionary<string, CurrentEntry> CurrentCache =
+            new Dictionary<string, CurrentEntry>(StringComparer.OrdinalIgnoreCase);
+
+        private const int CurrentTtlMs = 2000;
+
+        private sealed class CurrentEntry
+        {
+            public DisplayMode Mode;
+            public DateTime AtUtc;
+        }
+
+        private static int _generation;
+
+        public static void Invalidate()
+        {
+            lock (CacheSync)
+            {
+                _generation++;
+                ModesCache.Clear();
+                CurrentCache.Clear();
+            }
+        }
+
+        private static List<DisplayMode> CloneList(List<DisplayMode> src)
+        {
+            var list = new List<DisplayMode>(src.Count);
+            foreach (var m in src) list.Add(m.Clone());
+            return list;
+        }
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         private struct DEVMODE
         {
@@ -102,12 +137,36 @@ namespace ParaDesk.Core
 
         private const int ENUM_CURRENT_SETTINGS = -1;
 
-        /// <summary>枚举该显示器支持的全部模式（已按分辨率、刷新率排序去重）。</summary>
         public static List<DisplayMode> GetModes(string deviceName)
         {
+            if (string.IsNullOrEmpty(deviceName)) return new List<DisplayMode>();
+
+            int gen;
+            lock (CacheSync)
+            {
+                List<DisplayMode> cached;
+                if (ModesCache.TryGetValue(deviceName, out cached)) return CloneList(cached);
+                gen = _generation;
+            }
+
+            bool ok;
+            var fresh = EnumerateModes(deviceName, out ok);
+
+            if (ok && fresh.Count > 0)
+            {
+                lock (CacheSync)
+                {
+                    if (gen == _generation) ModesCache[deviceName] = CloneList(fresh);
+                }
+            }
+            return fresh;
+        }
+
+        private static List<DisplayMode> EnumerateModes(string deviceName, out bool ok)
+        {
+            ok = true;
             var list = new List<DisplayMode>();
             var seen = new HashSet<string>();
-            if (string.IsNullOrEmpty(deviceName)) return list;
 
             try
             {
@@ -132,6 +191,7 @@ namespace ParaDesk.Core
             }
             catch (Exception ex)
             {
+                ok = false;
                 Log.Error("枚举显示模式失败: " + deviceName, ex);
             }
 
@@ -145,33 +205,52 @@ namespace ParaDesk.Core
             return list;
         }
 
-        /// <summary>该显示器当前正在使用的模式。</summary>
         public static DisplayMode GetCurrent(string deviceName)
         {
             if (string.IsNullOrEmpty(deviceName)) return null;
+
+            int gen;
+            lock (CacheSync)
+            {
+                CurrentEntry cached;
+                if (CurrentCache.TryGetValue(deviceName, out cached) &&
+                    (DateTime.UtcNow - cached.AtUtc).TotalMilliseconds < CurrentTtlMs)
+                    return cached.Mode.Clone();
+                gen = _generation;
+            }
+
+            DisplayMode fresh = null;
             try
             {
                 var dm = new DEVMODE();
                 dm.dmSize = (ushort)Marshal.SizeOf(typeof(DEVMODE));
-                if (!EnumDisplaySettings(deviceName, ENUM_CURRENT_SETTINGS, ref dm)) return null;
-                return new DisplayMode
+                if (EnumDisplaySettings(deviceName, ENUM_CURRENT_SETTINGS, ref dm))
                 {
-                    Width = (int)dm.dmPelsWidth,
-                    Height = (int)dm.dmPelsHeight,
-                    Frequency = (int)dm.dmDisplayFrequency,
-                };
+                    fresh = new DisplayMode
+                    {
+                        Width = (int)dm.dmPelsWidth,
+                        Height = (int)dm.dmPelsHeight,
+                        Frequency = (int)dm.dmDisplayFrequency,
+                    };
+                }
             }
             catch (Exception ex)
             {
                 Log.Error("读取当前显示模式失败: " + deviceName, ex);
                 return null;
             }
+
+            if (fresh != null)
+            {
+                lock (CacheSync)
+                {
+                    if (gen == _generation)
+                        CurrentCache[deviceName] = new CurrentEntry { Mode = fresh.Clone(), AtUtc = DateTime.UtcNow };
+                }
+            }
+            return fresh;
         }
 
-        /// <summary>
-        /// 该显示器支持的分辨率（去掉刷新率维度）。
-        /// 注意宽度必须是偶数——RDP 显示协议的硬性要求，奇数宽会被整组忽略。
-        /// </summary>
         public static List<DisplayMode> GetResolutions(string deviceName)
         {
             var result = new List<DisplayMode>();
@@ -187,7 +266,6 @@ namespace ParaDesk.Core
             return result;
         }
 
-        /// <summary>该显示器支持的刷新率（从高到低）。</summary>
         public static List<int> GetRefreshRates(string deviceName)
         {
             var seen = new HashSet<int>();

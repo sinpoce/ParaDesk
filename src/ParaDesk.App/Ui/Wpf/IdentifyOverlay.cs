@@ -19,6 +19,9 @@ namespace ParaDesk.Shell
     internal static class IdentifyOverlay
     {
         private static readonly List<Window> Active = new List<Window>();
+
+        private static readonly List<Window> Fading = new List<Window>();
+
         private static DispatcherTimer _timer;
 
         /// <summary>在所有显示器上显示编号。重复调用会重置计时。</summary>
@@ -50,11 +53,16 @@ namespace ParaDesk.Shell
             }
         }
 
+        internal static int DisplayNumber(MonitorInfo m)
+        {
+            return m == null ? 0 : m.Index;
+        }
+
         private static Window CreateOverlay(MonitorInfo m)
         {
             var text = new TextBlock
             {
-                Text = m.Index.ToString(),
+                Text = DisplayNumber(m).ToString(),
                 FontSize = 132,
                 FontWeight = FontWeights.SemiBold,
                 Foreground = Brushes.White,
@@ -128,24 +136,31 @@ namespace ParaDesk.Shell
             foreach (var w in fading)
             {
                 var win = w;
+                Fading.Add(win);
                 var anim = new DoubleAnimation(win.Opacity, 0, TimeSpan.FromMilliseconds(220));
                 anim.Completed += delegate
                 {
-                    try { win.Close(); } catch { }
+                    if (Fading.Remove(win)) CloseQuietly(win);
                 };
                 win.BeginAnimation(UIElement.OpacityProperty, anim);
             }
         }
 
-        /// <summary>立即收起（不做动画）。</summary>
         public static void Hide()
         {
             if (_timer != null) _timer.Stop();
-            foreach (var w in Active)
-            {
-                try { w.Close(); } catch { }
-            }
+            foreach (var w in Active) CloseQuietly(w);
             Active.Clear();
+
+            var fading = new List<Window>(Fading);
+            Fading.Clear();
+            foreach (var w in fading) CloseQuietly(w);
+        }
+
+        private static void CloseQuietly(Window w)
+        {
+            try { w.Close(); }
+            catch (Exception ex) { Log.Debug("关闭屏幕识别窗口失败: " + ex.Message); }
         }
     }
 }

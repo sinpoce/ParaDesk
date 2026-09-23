@@ -26,13 +26,12 @@
             </ui:TitleBar.Icon>
         </ui:TitleBar>
 
-        <!-- 过滤条 -->
         <Grid Grid.Row="1" Margin="16,4,16,10">
             <StackPanel Orientation="Horizontal">
                 <ui:TextBox x:Name="TbFilter" Width="260" PlaceholderText="筛选关键字…"
-                            TextChanged="OnFilterChanged"/>
+                            TextChanged="OnFilterTextChanged"/>
                 <ComboBox x:Name="CbLevel" Width="130" Margin="8,0,0,0"
-                          SelectionChanged="OnFilterChanged">
+                          SelectionChanged="OnLevelChanged">
                     <ComboBoxItem Content="全部级别"/>
                     <ComboBoxItem Content="INFO 以上"/>
                     <ComboBoxItem Content="WARN 以上"/>
@@ -61,8 +60,15 @@
 
         <Border Grid.Row="3" Padding="16,12,16,16">
             <Grid>
-                <TextBlock x:Name="LblPath" VerticalAlignment="Center" Opacity="0.55" FontSize="12"/>
-                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock x:Name="LblPath" Grid.Column="0" VerticalAlignment="Center" Opacity="0.55"
+                           FontSize="12" TextTrimming="CharacterEllipsis" Margin="0,0,12,0"/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                    <ui:Button x:Name="BtnExport" Content="导出诊断包" Click="OnExport" Margin="0,0,8,0"
+                               Icon="{ui:SymbolIcon ArrowDownload24}"/>
                     <ui:Button Content="复制全部" Click="OnCopy" Margin="0,0,8,0"/>
                     <ui:Button Content="清空日志" Click="OnClear" Margin="0,0,8,0"/>
                     <ui:Button Content="关闭" Appearance="Primary" Click="OnClose"/>

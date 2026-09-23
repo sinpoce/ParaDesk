@@ -82,6 +82,7 @@ namespace ParaDesk.Core
         /// 会理所当然地以为"帧率是按屏保存的"——而那是做不到的。
         /// 列表纹丝不动，才是它是全局设置的最直接证据。
         /// 超出当前目标屏能力的档由界面另行标注，那是选值的建议，不是保存范围。
+        ///
         /// </summary>
         public static List<int> GetFpsChoicesForAll(IEnumerable<string> devices)
         {

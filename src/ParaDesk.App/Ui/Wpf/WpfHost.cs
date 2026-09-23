@@ -1,6 +1,8 @@
 using System;
 using System.Windows;
 using System.Windows.Media;
+using System.Windows.Threading;
+using Microsoft.Win32;
 using ParaDesk.Core;
 
 namespace ParaDesk.Shell
@@ -17,6 +19,13 @@ namespace ParaDesk.Shell
     internal static class WpfHost
     {
         private static bool _ready;
+        private static bool _hooksInstalled;
+
+        private static string _appliedThemeKey;
+
+        private static bool _themeCheckQueued;
+
+        public static event EventHandler ThemeChanged;
 
         public static bool Initialize()
         {
@@ -30,6 +39,7 @@ namespace ParaDesk.Shell
                     var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
                 }
 
+                InstallHooks();
                 LoadThemeResources();
                 _ready = true;
                 Log.Info("WPF 宿主已就绪");
@@ -40,6 +50,61 @@ namespace ParaDesk.Shell
                 Log.Error("初始化 WPF 宿主失败", ex);
                 return false;
             }
+        }
+
+        private static void InstallHooks()
+        {
+            if (_hooksInstalled) return;
+            var app = Application.Current;
+            if (app == null) return;
+
+            app.DispatcherUnhandledException += OnDispatcherUnhandledException;
+
+            try
+            {
+                SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("订阅系统主题变化失败（主题将不会自动跟随）: " + ex.Message);
+            }
+            _hooksInstalled = true;
+        }
+
+        private static void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
+        {
+            try { Program.ReportUnhandled(e.Exception, "WPF"); }
+            catch (Exception ex) { Log.Debug("汇报 WPF 未处理异常时又出错: " + ex.Message); }
+            e.Handled = true;
+        }
+
+        private static void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+        {
+            if (e.Category != UserPreferenceCategory.General) return;
+            try
+            {
+                var app = Application.Current;
+                if (app == null) return;
+                app.Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(QueueThemeCheck));
+            }
+            catch (Exception ex) { Log.Debug("封送主题变化通知失败: " + ex.Message); }
+        }
+
+        private static void QueueThemeCheck()
+        {
+            if (_themeCheckQueued) return;
+            _themeCheckQueued = true;
+            var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(300) };
+            timer.Tick += delegate
+            {
+                timer.Stop();
+                _themeCheckQueued = false;
+                if (!_ready) return;
+                if (string.Equals(CurrentThemeKey(), _appliedThemeKey, StringComparison.Ordinal)) return;
+                Log.Info("系统主题已变化，重新套用界面主题");
+                ApplyTheme();
+            };
+            timer.Start();
         }
 
         private static void LoadThemeResources()
@@ -87,7 +152,6 @@ namespace ParaDesk.Shell
             }
         }
 
-        /// <summary>跟随系统深浅色。</summary>
         public static void ApplyTheme()
         {
             try
@@ -95,17 +159,27 @@ namespace ParaDesk.Shell
                 // 命名空间刻意叫 ParaDesk.Shell 而非 ParaDesk.Ui.Wpf：
                 // 后者会与库的 Wpf.Ui 命名空间相对解析冲突，且 XAML 生成的代码
                 // 无法用 global:: 限定绕开。
+                string key = CurrentThemeKey();
                 var theme = SystemUsesLightTheme()
                     ? Wpf.Ui.Appearance.ApplicationTheme.Light
                     : Wpf.Ui.Appearance.ApplicationTheme.Dark;
                 Wpf.Ui.Appearance.ApplicationThemeManager.Apply(
                     theme, Wpf.Ui.Controls.WindowBackdropType.Mica, true);
                 MakeFlyoutsOpaque(theme == Wpf.Ui.Appearance.ApplicationTheme.Light);
+                _appliedThemeKey = key;
                 Log.Debug("已应用主题: " + theme);
             }
             catch (Exception ex)
             {
                 Log.Warn("应用 Fluent 主题失败（沿用默认外观）: " + ex.Message);
+                return;
+            }
+
+            var h = ThemeChanged;
+            if (h != null)
+            {
+                try { h(null, EventArgs.Empty); }
+                catch (Exception ex) { Log.Error("主题变化通知的处理方出错", ex); }
             }
         }
 
@@ -113,7 +187,6 @@ namespace ParaDesk.Shell
         /// 把下拉框/弹出菜单的背景改成不透明。
         /// Fluent 默认给这些浮层用亚克力（半透明）画刷，叠在正文之上时
         /// 会透出下方文字，选项读不清楚。菜单是要看清内容的，不该炫材质。
-        /// 主题切换后需要重新调用（画刷会被主题字典重新覆盖）。
         /// </summary>
         private static void MakeFlyoutsOpaque(bool light)
         {
@@ -135,7 +208,7 @@ namespace ParaDesk.Shell
             {
                 object v = null;
                 try { v = Application.Current.TryFindResource(key); }
-                catch { }
+                catch (Exception ex) { Log.Debug("查找主题底色 " + key + " 失败: " + ex.Message); }
                 if (v is Color) { solid = (Color)v; break; }
                 var b = v as SolidColorBrush;
                 if (b != null) { solid = b.Color; break; }
@@ -176,16 +249,39 @@ namespace ParaDesk.Shell
             Log.Debug("浮层画刷已置为不透明 " + ok + "/" + flyoutKeys.Length + "，色值 " + solid);
         }
 
+        private static string CurrentThemeKey()
+        {
+            return (SystemUsesLightTheme() ? "light" : "dark") + "/" + ReadAccentColor();
+        }
+
+        private static string ReadAccentColor()
+        {
+            try
+            {
+                object v = Registry.GetValue(@"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\DWM", "AccentColor", null);
+                return v == null ? "" : Convert.ToString(v);
+            }
+            catch (Exception ex)
+            {
+                Log.Debug("读取系统强调色失败: " + ex.Message);
+                return "";
+            }
+        }
+
         private static bool SystemUsesLightTheme()
         {
             try
             {
-                object v = Microsoft.Win32.Registry.GetValue(
+                object v = Registry.GetValue(
                     @"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize",
                     "AppsUseLightTheme", 1);
                 return v == null || Convert.ToInt32(v) != 0;
             }
-            catch { return true; }
+            catch (Exception ex)
+            {
+                Log.Debug("读取系统深浅色设置失败，按浅色处理: " + ex.Message);
+                return true;
+            }
         }
     }
 }

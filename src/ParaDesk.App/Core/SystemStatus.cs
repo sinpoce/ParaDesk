@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.Serialization;
 using System.ServiceProcess;
 using System.Text;
 using Microsoft.Win32;
@@ -6,31 +7,33 @@ using ParaDesk.Native;
 
 namespace ParaDesk.Core
 {
-    /// <summary>一次性环境体检结果，供首次配置向导与主界面状态区使用。</summary>
+    [DataContract]
     internal class EnvironmentReport
     {
-        public string EditionId;
-        public string BuildNumber;
-        public bool IsHomeEdition;
-        public bool ChildSessionsEnabled;
-        public bool TermServiceRunning;
-        public bool RdpListenerEnabled;
-        public bool RdpControlRegistered;
-        public bool InsideChildSession;
-        public uint ChildSessionId;
-        public int TransportStatus;
-        public string TransportPipe;
+        [DataMember(Name = "editionId", Order = 1)] public string EditionId;
+        [DataMember(Name = "buildNumber", Order = 2)] public string BuildNumber;
+        [DataMember(Name = "isHomeEdition", Order = 3)] public bool IsHomeEdition;
+        [DataMember(Name = "childSessionsEnabled", Order = 4)] public bool ChildSessionsEnabled;
+        [DataMember(Name = "termServiceRunning", Order = 5)] public bool TermServiceRunning;
+        [DataMember(Name = "rdpListenerEnabled", Order = 6)] public bool RdpListenerEnabled;
+        [DataMember(Name = "rdpControlRegistered", Order = 7)] public bool RdpControlRegistered;
+        [DataMember(Name = "insideChildSession", Order = 8)] public bool InsideChildSession;
+        [DataMember(Name = "childSessionId", Order = 9)] public uint ChildSessionId;
+        [DataMember(Name = "transportStatus", Order = 10)] public int TransportStatus;
+        [DataMember(Name = "transportPipe", Order = 11)] public string TransportPipe;
 
-        public bool TransportReady { get { return TransportStatus == 0; } }
+        [DataMember(Name = "transportReady", Order = 12)]
+        public bool TransportReady { get { return TransportStatus == 0; } private set { } }
 
-        /// <summary>全部就绪即可直接启动桌面。</summary>
+        [DataMember(Name = "readyToStart", Order = 13)]
         public bool ReadyToStart
         {
             get
             {
-                return !IsHomeEdition && ChildSessionsEnabled && TermServiceRunning
-                       && RdpControlRegistered && !InsideChildSession && TransportReady;
+                return !IsHomeEdition && !InsideChildSession && RdpControlRegistered
+                       && !SetupIncomplete && TransportReady;
             }
+            private set { }
         }
 
         /// <summary>
@@ -38,18 +41,26 @@ namespace ParaDesk.Core
         /// 与 ReadyToStart 之间还夹着"能配好、只是还没配"这一档，
         /// 两者不能混为一谈——后者不该把「启动桌面」按钮变灰。
         /// </summary>
+        [DataMember(Name = "blocked", Order = 14)]
         public bool Blocked
         {
             get { return IsHomeEdition || !RdpControlRegistered || InsideChildSession; }
+            private set { }
         }
 
-        /// <summary>只差一次管理员授权就能就绪。</summary>
+        [DataMember(Name = "needsSetup", Order = 15)]
         public bool NeedsSetup
         {
             get { return !Blocked && !ReadyToStart; }
+            private set { }
         }
 
-        /// <summary>给用户看的下一步建议；null 表示无需操作。</summary>
+        private bool SetupIncomplete
+        {
+            get { return !ChildSessionsEnabled || !RdpListenerEnabled || !TermServiceRunning; }
+        }
+
+        [DataMember(Name = "nextAction", Order = 16)]
         public string NextAction
         {
             get
@@ -57,12 +68,13 @@ namespace ParaDesk.Core
                 if (IsHomeEdition) return L.T("Windows 家庭版不支持子会话，请使用专业版及以上，或改用虚拟机桌面。");
                 if (InsideChildSession) return L.T("请在主桌面上运行本程序（当前似乎在分身桌面内）。");
                 if (!RdpControlRegistered) return L.T("系统缺少远程桌面客户端控件，无法运行。");
-                if (!ChildSessionsEnabled || !RdpListenerEnabled || !TermServiceRunning)
+                if (SetupIncomplete)
                     return L.T("点「启动桌面」即可自动完成配置（需要一次管理员授权）。");
                 if (!TransportReady)
                     return L.T("配置已写入，但子会话监听器需重启电脑后才会启动。请重启电脑。");
                 return null;
             }
+            private set { }
         }
     }
 
@@ -97,13 +109,28 @@ namespace ParaDesk.Core
             return childId != NativeMethods.NoChildSession && childId != 0 && childId == mySession;
         }
 
-        public static bool InRemoteSession()
+        private static string _editionId;
+        private static string _buildNumber;
+
+        private const string CurrentVersionKey = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+
+        public static string EditionId()
         {
-            return NativeMethods.GetSystemMetrics(NativeMethods.SM_REMOTESESSION) != 0;
+            string v = _editionId;
+            if (v != null) return v;
+            v = ReadHklm(CurrentVersionKey, "EditionID");
+            if (v.Length > 0) _editionId = v;
+            return v;
         }
 
-        public static string EditionId() { return ReadHklm(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "EditionID"); }
-        public static string BuildNumber() { return ReadHklm(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "CurrentBuild"); }
+        public static string BuildNumber()
+        {
+            string v = _buildNumber;
+            if (v != null) return v;
+            v = ReadHklm(CurrentVersionKey, "CurrentBuild");
+            if (v.Length > 0) _buildNumber = v;
+            return v;
+        }
 
         /// <summary>家庭版 EditionID 以 Core 开头。不可用 ProductName——Win11 上它仍写 "Windows 10"。</summary>
         public static bool IsHomeEdition()

@@ -67,6 +67,7 @@ namespace ParaDesk.Rdp
         private OverlayWindow _overlay;
         private bool _active;
         private bool _disposed;
+        private bool _repositionFailLogged;
 
         public bool IsActive { get { return _active; } }
 
@@ -93,7 +94,6 @@ namespace ParaDesk.Rdp
             }
         }
 
-        /// <summary>窗口移动/改尺寸后重新贴合。</summary>
         public void Reposition()
         {
             if (!_active || _overlay == null || _owner == null) return;
@@ -101,8 +101,16 @@ namespace ParaDesk.Rdp
             {
                 Rectangle r = _owner.RectangleToScreen(_owner.ClientRectangle);
                 _overlay.Bounds = r;
+                _repositionFailLogged = false;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                if (!_repositionFailLogged)
+                {
+                    _repositionFailLogged = true;
+                    Log.Warn("仅查看覆盖层贴合失败，部分画面可能没有被挡住: " + ex.Message);
+                }
+            }
         }
 
         private void Enable()
@@ -113,7 +121,7 @@ namespace ParaDesk.Rdp
             if (_overlay == null) _overlay = new OverlayWindow();
             Reposition();
             if (!_overlay.Visible) _overlay.Show(_owner);
-            _overlay.Bounds = _owner.RectangleToScreen(_owner.ClientRectangle);
+            Reposition();
         }
 
         private void Disable()
@@ -136,7 +144,10 @@ namespace ParaDesk.Rdp
                 if (_active) Disable();
                 if (_overlay != null) { _overlay.Dispose(); _overlay = null; }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log.Debug("释放仅查看覆盖层失败: " + ex.Message);
+            }
         }
     }
 }

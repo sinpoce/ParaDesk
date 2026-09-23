@@ -24,43 +24,65 @@ namespace ParaDesk.Recording
         public string FilePath { get; private set; }
         public string Error { get; private set; }
         public TimeSpan Duration { get; private set; }
+        public string Warning { get; set; }
         public RecordingStoppedEventArgs(string path, string error, TimeSpan dur)
         {
             FilePath = path; Error = error; Duration = dur;
         }
     }
 
-    /// <summary>
-    /// 屏幕/窗口录制器。
-    ///
-    /// 管线：GraphicsCaptureItem → Direct3D11CaptureFramePool（帧到达）
-    ///       → MediaStreamSource（按需供样）→ MediaTranscoder → MP4(H.264)
-    ///
-    /// 选择这条 WinRT 全链路而不是 Media Foundation 手写互操作：后者光是
-    /// IMFAttributes/IMFMediaType/IMFSample 就要重复声明上百个方法（C# 不继承
-    /// COM 虚表布局），而 WinRT 在 .NET Framework 上有 CLR 自带投影，代码量差一个量级。
-    /// </summary>
     internal class ScreenRecorder : IDisposable
     {
+        private const int FramePoolBuffers = 5;
+
+        private static readonly DirectXPixelFormat CaptureFormat = DirectXPixelFormat.B8G8R8A8UIntNormalized;
+
+        /// <summary>每次交付的音频块时长。20ms 是编码器友好的粒度。</summary>
+        private static readonly TimeSpan AudioChunk = TimeSpan.FromMilliseconds(20);
+
+        private static readonly TimeSpan StartingFirstFrameWait = TimeSpan.FromMilliseconds(960);
+        private const int StartingPollMs = 8;
+
+        private static readonly TimeSpan FirstFrameTimeout = TimeSpan.FromSeconds(6);
+        private const int FirstFramePollMs = 10;
+
+        private const int PacingSleepMaxMs = 15;
+
+        private const int PausePollMs = 30;
+
+        private static readonly TimeSpan AudioLeadLimit = TimeSpan.FromMilliseconds(200);
+        private const int AudioLeadSleepMaxMs = 100;
+
+        private const uint AacBitrate = 192000;
+
+        private const int MaxConsecutiveGrabFailures = 50;
+
+        private const long MinFreeBytesToStart = 500L * 1024 * 1024;
+
+        private static readonly TimeSpan DisposeFinishTimeout = TimeSpan.FromSeconds(10);
+
         private readonly object _sync = new object();
 
         private IDirect3DDevice _device;
         private IntPtr _nativeDevice, _nativeContext;
         private GraphicsCaptureItem _item;
-        private Direct3D11CaptureFramePool _pool;
-        private GraphicsCaptureSession _session;
         private MediaStreamSource _mss;
         private VideoStreamDescriptor _videoDescriptor;
         private AudioStreamDescriptor _audioDescriptor;
         private AudioMixer _audio;
         private IRandomAccessStream _stream;
 
-        /// <summary>每次交付的音频块时长。20ms 是编码器友好的粒度。</summary>
-        private static readonly TimeSpan AudioChunk = TimeSpan.FromMilliseconds(20);
+        private RecordingOptions _options;
 
         private SizeInt32 _size;        // 交给编码器的输出尺寸，一经确定不再变
-        private SizeInt32 _poolSize;    // 帧池尺寸，跟随目标窗口变化
-        private RecorderState _state = RecorderState.Idle;
+        private volatile RecorderState _state = RecorderState.Idle;
+
+        private PoolSlot _current;
+        private readonly List<PoolSlot> _retired = new List<PoolSlot>();
+        private readonly List<PoolSlot> _closable = new List<PoolSlot>();
+        private bool _closeScheduled;
+        private readonly Dictionary<Direct3D11CaptureFrame, PoolSlot> _owner =
+            new Dictionary<Direct3D11CaptureFrame, PoolSlot>();
 
         /// <summary>
         /// 墙钟。输出时间轴直接等于真实流逝时间，避免录出来忽快忽慢。
@@ -88,9 +110,22 @@ namespace ParaDesk.Recording
         /// 还给帧池，WGC 随即把新画面覆盖上去——编码器于是编到了错误的内容。
         /// 所以只要还有样本引用某一帧，就绝不能释放它；等样本的 Processed 事件到了再放。
         /// 静止画面会重复使用同一帧，因此必须计数而不是布尔标记。
+        ///
         /// </summary>
         private readonly Dictionary<Direct3D11CaptureFrame, int> _inFlight =
             new Dictionary<Direct3D11CaptureFrame, int>();
+
+        private bool _used;
+        private bool _pipelineStarted;
+        private bool _startFailed;
+        private bool _framesClosed;
+        private bool _finished;
+        private readonly ManualResetEventSlim _finishedEvent = new ManualResetEventSlim(false);
+
+        private string _pendingError;
+        private readonly List<string> _warnings = new List<string>();
+        private int _audioFailedRaised;
+        private int _grabFailures;
 
         public RecorderState State { get { return _state; } }
         public string OutputPath { get { return _outputPath; } }
@@ -109,36 +144,71 @@ namespace ParaDesk.Recording
         /// <summary>是否处于暂停状态。</summary>
         public bool IsPaused { get { return _paused; } }
 
+        private bool IsCancelled
+        {
+            get
+            {
+                var cts = _cts;
+                return cts == null || cts.IsCancellationRequested;
+            }
+        }
+
         /// <summary>
         /// 暂停 / 恢复。停表意味着暂停期间不产生样本，也不计入视频时长，
         /// 恢复后画面直接接上——比录一段静止画面再后期剪掉有用得多。
         /// </summary>
         public void SetPaused(bool paused)
         {
-            if (_state != RecorderState.Recording || _paused == paused) return;
-            _paused = paused;
-            try
+            AudioMixer audio = null;
+            lock (_sync)
             {
-                if (_clock == null) return;
-                if (paused) _clock.Stop();
-                else _clock.Start();
+                if (_state != RecorderState.Recording || _paused == paused) return;
+                _paused = paused;
+                var clock = _clock;
+                if (clock != null)
+                {
+                    if (paused) clock.Stop();
+                    else clock.Start();
+                }
+                if (!paused) audio = _audio;
             }
-            catch { }
+            if (audio != null) audio.DiscardBuffered();
             Log.Info(paused ? "录制已暂停" : "录制已恢复");
         }
 
         public event EventHandler<RecordingStoppedEventArgs> Stopped;
 
-        /// <summary>开始录制。返回 null 表示已开始，否则为错误说明。</summary>
+        public event Action<string> AudioFailed;
+
+        public static long GetFreeBytes(string folder)
+        {
+            return CaptureHelpers.GetFreeBytes(folder);
+        }
+
         public string Start(CaptureTarget target, RecordingOptions options)
         {
             lock (_sync)
             {
                 if (_state != RecorderState.Idle) return L.T("已经在录制中。");
+                if (_used) return L.T("该录制器已经用过一次，请新建一个再录制。");
                 if (target == null) return L.T("未选择录制目标。");
                 if (!CaptureItemFactory.IsSupported)
                     return L.T("当前系统不支持屏幕捕获（需要 Windows 10 1903 或更高版本）。");
 
+                var opts = options != null ? options.Clone() : RecordingOptions.CreateDefault();
+                opts.Normalize();
+
+                long free = CaptureHelpers.GetFreeBytes(opts.OutputFolder);
+                if (free >= 0 && free < MinFreeBytesToStart)
+                {
+                    Log.Warn("录制目录所在磁盘剩余 " + free + " 字节，拒绝开始录制");
+                    return string.Format(L.T("录制目录所在磁盘只剩 {0}（至少需要 {1}），无法开始录制。"),
+                        CaptureHelpers.FormatBytes(free), CaptureHelpers.FormatBytes(MinFreeBytesToStart));
+                }
+
+                _options = opts;
+                _used = true;
+                _cts = new CancellationTokenSource();
                 _state = RecorderState.Starting;
             }
 
@@ -148,211 +218,380 @@ namespace ParaDesk.Recording
                     ? CaptureItemFactory.CreateForWindow(target.Handle)
                     : CaptureItemFactory.CreateForMonitor(target.Handle);
 
-                if (_item == null)
-                {
-                    _state = RecorderState.Idle;
-                    return L.T("无法捕获该目标（窗口可能已关闭）。");
-                }
+                if (_item == null) return FailStart(L.T("无法捕获该目标（窗口可能已关闭）。"));
 
                 _device = Direct3DHelper.CreateDevice(out _nativeDevice, out _nativeContext);
-                if (_device == null)
-                {
-                    _state = RecorderState.Idle;
-                    return L.T("显卡设备初始化失败，无法录制。");
-                }
+                if (_device == null) return FailStart(L.T("显卡设备初始化失败，无法录制。"));
 
                 // 编码器要求宽高为偶数
-                _size = new SizeInt32
-                {
-                    Width = _item.Size.Width - (_item.Size.Width % 2),
-                    Height = _item.Size.Height - (_item.Size.Height % 2),
-                };
-                if (_size.Width < 2 || _size.Height < 2)
-                {
-                    _state = RecorderState.Idle;
-                    return L.T("目标尺寸无效。");
-                }
+                _size = CaptureHelpers.EvenSize(_item.Size.Width, _item.Size.Height);
+                if (!CaptureHelpers.IsUsableSize(_size)) return FailStart(L.T("目标尺寸无效。"));
 
-                // 5 个缓冲：我们要保留最近一帧用于静止时重发，还要留出编码器
-                // 尚未处理完的在途帧的余量；缓冲不足会导致 WGC 停止送新帧。
-                _poolSize = _size;
-                _pool = Direct3D11CaptureFramePool.CreateFreeThreaded(
-                    _device, DirectXPixelFormat.B8G8R8A8UIntNormalized, 5, _poolSize);
-                _pool.FrameArrived += OnFrameArrived;
-
-                _session = _pool.CreateCaptureSession(_item);
-                TryConfigureSession(options);
+                var slot = CreatePoolSlot(_size);
+                lock (_sync) _current = slot;
 
                 _item.Closed += OnItemClosed;
 
-                _outputPath = BuildOutputPath(options, target);
+                _outputPath = BuildOutputPath(_options, target);
                 Directory.CreateDirectory(Path.GetDirectoryName(_outputPath));
 
                 _startedAt = DateTime.Now;
-                _cts = new CancellationTokenSource();
 
-                int fps = options.FrameRate < 5 ? 30 : options.FrameRate;
+                int fps = _options.FrameRate;
                 _frameInterval = TimeSpan.FromTicks(TimeSpan.TicksPerSecond / fps);
                 _nextSampleTime = TimeSpan.Zero;
                 _clock = System.Diagnostics.Stopwatch.StartNew();
 
                 // 音频要在编码管线建立之前就开始采，否则视频开头会缺声音
-                if (options.Audio != AudioSource.None)
+                if (_options.Audio != AudioSource.None)
                 {
-                    _audio = new AudioMixer();
-                    string audioErr = _audio.Start(options.Audio);
+                    var mixer = new AudioMixer();
+                    string audioErr = mixer.Start(_options.Audio);
                     if (audioErr != null)
                     {
                         // 音频失败不阻断录制——静音的视频总好过什么都没有
                         Log.Warn("音频不可用，改为无声录制：" + audioErr);
-                        _audio.Dispose();
-                        _audio = null;
+                        CaptureHelpers.SafeDispose(mixer, "释放音频采集");
                         AudioWarning = audioErr;
+                    }
+                    else
+                    {
+                        lock (_sync) _audio = mixer;
                     }
                 }
                 HasAudio = _audio != null && _audio.Enabled;
 
-                BuildPipelineAndRun(options);
+                string earlyStop = null;
+                lock (_sync)
+                {
+                    if (_state != RecorderState.Starting)
+                        earlyStop = _pendingError ?? L.T("无法捕获该目标（窗口可能已关闭）。");
+                }
+                if (earlyStop != null)
+                {
+                    Log.Info("启动途中录制已被叫停（多半是目标已关闭），放弃开始录制");
+                    return FailStart(earlyStop);
+                }
 
-                _session.StartCapture();
-                _state = RecorderState.Recording;
-                Log.Info("开始录制 -> " + _outputPath + "  " + _size.Width + "×" + _size.Height);
+                BuildPipelineAndRun();
+
+                try { slot.Session.StartCapture(); }
+                catch (Exception ex)
+                {
+                    bool stopped;
+                    lock (_sync) stopped = _state != RecorderState.Starting;
+                    if (!stopped) throw;
+                    Log.Info("启动途中录制已被叫停（多半是目标已关闭），捕获会话已停止: " + ex.Message);
+                    return FailStart(L.T("无法捕获该目标（窗口可能已关闭）。"));
+                }
+
+                bool stoppedMeanwhile;
+                lock (_sync)
+                {
+                    if (_state == RecorderState.Starting) _state = RecorderState.Recording;
+                    stoppedMeanwhile = _state != RecorderState.Recording;
+                }
+                if (stoppedMeanwhile) StopCore();
+
+                Log.Info("开始录制 -> " + _outputPath + "  " + _size.Width + "×" + _size.Height + "  " + fps + "fps");
                 return null;
             }
             catch (Exception ex)
             {
                 Log.Error("启动录制失败", ex);
-                // 失败发生在编码管线起来之前，此时直接清理是安全的；
-                // 若管线已启动，让它自己走 Finish 收尾，这里只标记取消。
-                try { if (_cts != null) _cts.Cancel(); } catch { }
-                CleanUp();
-                _state = RecorderState.Idle;
-                return L.T("启动录制失败：") + ex.Message;
+                return FailStart(L.T("启动录制失败：") + ex.Message);
             }
         }
 
-        private void TryConfigureSession(RecordingOptions options)
+        private string FailStart(string error)
         {
-            // 光标是否入镜
-            try { _session.IsCursorCaptureEnabled = options.CaptureCursor; }
-            catch (Exception ex) { Log.Debug("设置光标捕获失败: " + ex.Message); }
-
-            // 黄色捕获边框只有 Win11 能关；Win10 上属于系统行为，无法消除
-            if (CaptureItemFactory.CanHideBorder)
+            bool pipeline;
+            lock (_sync)
             {
-                try { _session.IsBorderRequired = false; }
-                catch (Exception ex) { Log.Debug("隐藏捕获边框失败: " + ex.Message); }
+                _startFailed = true;
+                pipeline = _pipelineStarted;
+                if (!_finished) _state = pipeline ? RecorderState.Stopping : RecorderState.Idle;
+            }
+            if (pipeline) StopCore();
+            else CleanUp();
+            return error;
+        }
+
+        private PoolSlot CreatePoolSlot(SizeInt32 size)
+        {
+            var slot = new PoolSlot { Size = size };
+            try
+            {
+                slot.Pool = Direct3D11CaptureFramePool.CreateFreeThreaded(
+                    _device, CaptureFormat, FramePoolBuffers, size);
+                slot.Handler = delegate(Direct3D11CaptureFramePool sender, object args) { OnFrameArrived(slot, sender); };
+                slot.Pool.FrameArrived += slot.Handler;
+                slot.Session = slot.Pool.CreateCaptureSession(_item);
+                CaptureHelpers.ConfigureSession(slot.Session, _options.CaptureCursor);
+                return slot;
+            }
+            catch
+            {
+                slot.Close();
+                throw;
             }
         }
 
-        private void BuildPipelineAndRun(RecordingOptions options)
+        private void BuildPipelineAndRun()
         {
-            var videoProps = VideoEncodingProperties.CreateUncompressed(
-                MediaEncodingSubtypes.Bgra8, (uint)_size.Width, (uint)_size.Height);
-            _videoDescriptor = new VideoStreamDescriptor(videoProps);
-
-            if (_audio != null && _audio.Enabled)
-            {
-                var audioProps = AudioEncodingProperties.CreatePcm(
-                    (uint)AudioMixer.SampleRate, (uint)AudioMixer.Channels,
-                    (uint)AudioMixer.BitsPerSample);
-                _audioDescriptor = new AudioStreamDescriptor(audioProps);
-                _mss = new MediaStreamSource(_videoDescriptor, _audioDescriptor);
-            }
-            else
-            {
-                _mss = new MediaStreamSource(_videoDescriptor);
-            }
-
-            _mss.BufferTime = TimeSpan.Zero;   // 实时源，不缓冲
-            _mss.Starting += OnMssStarting;
-            _mss.SampleRequested += OnMssSampleRequested;
+            var opts = _options;
+            CreateMediaStreamSource();
 
             var profile = MediaEncodingProfile.CreateMp4(VideoEncodingQuality.HD1080p);
             profile.Video.Width = (uint)_size.Width;
             profile.Video.Height = (uint)_size.Height;
-            profile.Video.Bitrate = (uint)options.BitrateBps;
-            profile.Video.FrameRate.Numerator = (uint)options.FrameRate;
+            profile.Video.Bitrate = (uint)opts.BitrateBps;
+            profile.Video.FrameRate.Numerator = (uint)opts.FrameRate;
             profile.Video.FrameRate.Denominator = 1;
 
-            profile.Audio = (_audio != null && _audio.Enabled)
+            profile.Audio = HasAudio
                 ? AudioEncodingProperties.CreateAac(
-                    (uint)AudioMixer.SampleRate, (uint)AudioMixer.Channels, 192000)
+                    (uint)AudioMixer.SampleRate, (uint)AudioMixer.Channels, AacBitrate)
                 : null;
 
             var transcoder = new MediaTranscoder { HardwareAccelerationEnabled = true };
             string path = _outputPath;
 
+            lock (_sync) _pipelineStarted = true;
             Task.Run(async delegate
             {
+                string error = null;
+                bool created = false;
                 try
                 {
                     var folder = await StorageFolder.GetFolderFromPathAsync(Path.GetDirectoryName(path));
                     var file = await folder.CreateFileAsync(Path.GetFileName(path),
                         CreationCollisionOption.ReplaceExisting);
+                    created = true;
                     _stream = await file.OpenAsync(FileAccessMode.ReadWrite);
 
                     var prep = await transcoder.PrepareMediaStreamSourceTranscodeAsync(
                         _mss, _stream, profile);
-                    if (!prep.CanTranscode)
+                    if (!prep.CanTranscode && transcoder.HardwareAccelerationEnabled)
                     {
-                        Finish(L.T("编码器不接受该配置：") + prep.FailureReason);
-                        return;
+                        Log.Warn("硬件编码器不接受该配置（" + prep.FailureReason + "），关闭硬件加速重试一次");
+                        transcoder.HardwareAccelerationEnabled = false;
+                        PrepareRetry();
+                        prep = await transcoder.PrepareMediaStreamSourceTranscodeAsync(
+                            _mss, _stream, profile);
+                        if (prep.CanTranscode)
+                        {
+                            Log.Info("已改用软件编码");
+                            AddWarning(L.T("硬件编码器不接受该配置，已改用软件编码"));
+                        }
                     }
-                    // 一直阻塞到 MediaStreamSource 结束（我们在停止时通知它）
-                    await prep.TranscodeAsync();
-                    Finish(null);
+
+                    if (!prep.CanTranscode)
+                        error = L.T("编码器不接受该配置：") + prep.FailureReason;
+                    else
+                        await prep.TranscodeAsync();   // 一直阻塞到 MediaStreamSource 结束（我们在停止时通知它）
                 }
                 catch (Exception ex)
                 {
                     Log.Error("录制管线异常", ex);
-                    Finish(L.T("录制失败：") + ex.Message);
+                    error = L.T("录制失败：") + ex.Message;
                 }
+                Finish(error, created);
             });
         }
 
-        private void OnFrameArrived(Direct3D11CaptureFramePool sender, object args)
+        private void CreateMediaStreamSource()
         {
-            try
+            var videoProps = VideoEncodingProperties.CreateUncompressed(
+                MediaEncodingSubtypes.Bgra8, (uint)_size.Width, (uint)_size.Height);
+            var video = new VideoStreamDescriptor(videoProps);
+
+            AudioStreamDescriptor audio = null;
+            MediaStreamSource mss;
+            if (HasAudio)
             {
-                var frame = sender.TryGetNextFrame();
-                if (frame == null) return;
-
-                // 目标窗口改了大小：帧池仍按旧尺寸分配，新内容只占纹理的一角，
-                // 四周残留旧像素。重建帧池让它跟上，但**不改**已声明给编码器的
-                // 输出尺寸——那是不能中途变的，超出部分裁掉、不足部分留黑边。
-                var content = frame.ContentSize;
-                if (content.Width > 0 && content.Height > 0 &&
-                    (content.Width != _poolSize.Width || content.Height != _poolSize.Height))
-                {
-                    int w = Math.Max(2, content.Width - (content.Width % 2));
-                    int h = Math.Max(2, content.Height);
-                    _poolSize = new SizeInt32 { Width = w, Height = h };
-                    try
-                    {
-                        sender.Recreate(_device, DirectXPixelFormat.B8G8R8A8UIntNormalized, 5, _poolSize);
-                        Log.Info("捕获目标尺寸变化，帧池已重建为 " + w + "×" + h);
-                    }
-                    catch (Exception ex) { Log.Debug("重建帧池失败: " + ex.Message); }
-                }
-
-                lock (_sync)
-                {
-                    if (_state != RecorderState.Recording && _state != RecorderState.Starting)
-                    {
-                        frame.Dispose();
-                        return;
-                    }
-                    // 始终持有最新一帧；旧帧只有在没人引用时才归还池子
-                    var old = _lastFrame;
-                    _lastFrame = frame;
-                    ReleaseFrameLocked(old);
-                }
+                var audioProps = AudioEncodingProperties.CreatePcm(
+                    (uint)AudioMixer.SampleRate, (uint)AudioMixer.Channels,
+                    (uint)AudioMixer.BitsPerSample);
+                audio = new AudioStreamDescriptor(audioProps);
+                mss = new MediaStreamSource(video, audio);
             }
-            catch (Exception ex) { Log.Debug("取帧失败: " + ex.Message); }
+            else
+            {
+                mss = new MediaStreamSource(video);
+            }
+
+            mss.BufferTime = TimeSpan.Zero;   // 实时源，不缓冲
+            mss.Starting += OnMssStarting;
+            mss.SampleRequested += OnMssSampleRequested;
+
+            _videoDescriptor = video;
+            _audioDescriptor = audio;
+            _mss = mss;
         }
 
-        /// <summary>登记一次引用。必须在持有 _sync 时调用。</summary>
+        private void DetachMediaStreamSource()
+        {
+            var mss = _mss;
+            if (mss == null) return;
+            CaptureHelpers.SafeRun(delegate
+            {
+                mss.Starting -= OnMssStarting;
+                mss.SampleRequested -= OnMssSampleRequested;
+            }, "解除 MediaStreamSource 事件");
+        }
+
+        private void PrepareRetry()
+        {
+            DetachMediaStreamSource();
+            CreateMediaStreamSource();
+            var stream = _stream;
+            if (stream != null)
+            {
+                stream.Size = 0;
+                stream.Seek(0);
+            }
+        }
+
+        private void OnFrameArrived(PoolSlot slot, Direct3D11CaptureFramePool sender)
+        {
+            Direct3D11CaptureFrame frame;
+            try { frame = sender.TryGetNextFrame(); }
+            catch (Exception ex)
+            {
+                OnGrabFailed(slot, ex);
+                return;
+            }
+            if (frame == null) return;
+            Interlocked.Exchange(ref _grabFailures, 0);
+
+            SizeInt32 content = slot.Size;
+            try { content = frame.ContentSize; }
+            catch (Exception ex) { Log.Debug("读取帧内容尺寸失败: " + ex.Message); }
+
+            bool accepted = false, resize = false;
+            SizeInt32 want = slot.Size;
+            lock (_sync)
+            {
+                if (!_framesClosed && !slot.Retired &&
+                    (_state == RecorderState.Recording || _state == RecorderState.Starting))
+                {
+                    _owner[frame] = slot;
+                    slot.Outstanding++;
+                    var old = _lastFrame;
+                    _lastFrame = frame;
+                    DropLastFrameHoldLocked(old);
+                    accepted = true;
+
+                    if (content.Width > 0 && content.Height > 0 &&
+                        ReferenceEquals(slot, _current) && !slot.SwitchPending)
+                    {
+                        want = CaptureHelpers.EvenPoolSize(content);
+                        if (!CaptureHelpers.SameSize(want, slot.Size) &&
+                            !CaptureHelpers.SameSize(want, slot.FailedResize))
+                        {
+                            slot.SwitchPending = true;
+                            resize = true;
+                        }
+                    }
+                }
+            }
+
+            if (!accepted) CaptureHelpers.SafeDispose(frame, "归还多余的捕获帧");
+
+            ScheduleClosePools();
+
+            if (resize) ThreadPool.QueueUserWorkItem(delegate { SwitchPool(slot, want); });
+        }
+
+        private void OnGrabFailed(PoolSlot slot, Exception ex)
+        {
+            if (slot.Retired || _state != RecorderState.Recording)
+            {
+                Log.Debug("取帧失败（旧帧池或录制已在收尾）: " + ex.Message);
+                return;
+            }
+
+            int n = Interlocked.Increment(ref _grabFailures);
+            if (n < MaxConsecutiveGrabFailures)
+            {
+                Log.Debug("取帧失败 #" + n + ": " + ex.Message);
+                return;
+            }
+            if (n > MaxConsecutiveGrabFailures) return;
+
+            Log.Warn("连续 " + n + " 次取帧失败，判定显卡设备丢失或捕获目标失效，结束录制: " + ex.Message);
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                if (_state != RecorderState.Recording) return;
+                EndWithError(L.T("录制中断：连续无法获取画面（显卡设备可能已丢失）。"));
+            });
+        }
+
+        private void SwitchPool(PoolSlot from, SizeInt32 size)
+        {
+            lock (_sync)
+            {
+                if (_framesClosed || !ReferenceEquals(_current, from) ||
+                    (_state != RecorderState.Recording && _state != RecorderState.Starting))
+                {
+                    from.SwitchPending = false;
+                    return;
+                }
+            }
+
+            PoolSlot slot;
+            try { slot = CreatePoolSlot(size); }
+            catch (Exception ex)
+            {
+                Log.Warn("捕获目标尺寸变化，但新建 " + size.Width + "×" + size.Height + " 帧池失败，继续用旧帧池: " + ex.Message);
+                lock (_sync)
+                {
+                    from.FailedResize = size;
+                    from.SwitchPending = false;
+                }
+                return;
+            }
+
+            bool installed = false;
+            lock (_sync)
+            {
+                if (!_framesClosed && ReferenceEquals(_current, from) &&
+                    (_state == RecorderState.Recording || _state == RecorderState.Starting))
+                {
+                    from.Retired = true;
+                    _current = slot;
+                    if (from.Outstanding <= 0) { from.Queued = true; _closable.Add(from); }
+                    else _retired.Add(from);
+                    installed = true;
+                }
+                else from.SwitchPending = false;
+            }
+            if (!installed)
+            {
+                slot.Close();
+                return;
+            }
+
+            from.StopSession();
+            try
+            {
+                slot.Session.StartCapture();
+                Log.Info("捕获目标尺寸变化，已换用 " + size.Width + "×" + size.Height +
+                         " 的新帧池（旧帧池待其帧全部归还后释放）");
+            }
+            catch (Exception ex)
+            {
+                if (_state == RecorderState.Recording)
+                {
+                    Log.Warn("新帧池启动捕获失败: " + ex.Message);
+                    EndWithError(L.T("录制中断：目标尺寸变化后无法继续捕获画面。"));
+                }
+                else Log.Debug("新帧池启动捕获失败（录制已在收尾）: " + ex.Message);
+            }
+            ScheduleClosePools();
+        }
+
         private void AddRefFrameLocked(Direct3D11CaptureFrame frame)
         {
             if (frame == null) return;
@@ -360,42 +599,95 @@ namespace ParaDesk.Recording
             _inFlight[frame] = _inFlight.TryGetValue(frame, out n) ? n + 1 : 1;
         }
 
-        /// <summary>
-        /// 释放一次引用；当它既不再是最新帧、也没有任何样本引用时才真正归还池子。
-        /// 必须在持有 _sync 时调用。
-        /// </summary>
-        private void ReleaseFrameLocked(Direct3D11CaptureFrame frame)
+        private void DropLastFrameHoldLocked(Direct3D11CaptureFrame old)
         {
-            if (frame == null) return;
+            if (old == null) return;
+            if (_inFlight.ContainsKey(old)) return;
+            DisposeFrameLocked(old);
+        }
 
+        private void ReleaseSampleRefLocked(Direct3D11CaptureFrame frame)
+        {
+            if (frame == null || _framesClosed) return;
             int n;
-            if (_inFlight.TryGetValue(frame, out n))
-            {
-                if (n > 1) { _inFlight[frame] = n - 1; return; }
-                _inFlight.Remove(frame);
-            }
+            if (!_inFlight.TryGetValue(frame, out n)) return;
+            if (n > 1) { _inFlight[frame] = n - 1; return; }
+            _inFlight.Remove(frame);
 
             if (ReferenceEquals(frame, _lastFrame)) return;   // 还要留着重发
-            try { frame.Dispose(); } catch { }
+            DisposeFrameLocked(frame);
+        }
+
+        private void DisposeFrameLocked(Direct3D11CaptureFrame frame)
+        {
+            PoolSlot slot;
+            if (_owner.TryGetValue(frame, out slot))
+            {
+                _owner.Remove(frame);
+                slot.Outstanding--;
+                if (slot.Retired && slot.Outstanding <= 0 && !slot.Queued)
+                {
+                    slot.Queued = true;
+                    _retired.Remove(slot);
+                    _closable.Add(slot);
+                }
+            }
+            CaptureHelpers.SafeDispose(frame, "归还捕获帧");
+        }
+
+        private void ScheduleClosePools()
+        {
+            lock (_sync)
+            {
+                if (_closable.Count == 0 || _closeScheduled) return;
+                _closeScheduled = true;
+            }
+            ThreadPool.QueueUserWorkItem(delegate { ClosePendingPools(); });
+        }
+
+        private void ClosePendingPools()
+        {
+            List<PoolSlot> list;
+            lock (_sync)
+            {
+                _closeScheduled = false;
+                if (_closable.Count == 0) return;
+                list = new List<PoolSlot>(_closable);
+                _closable.Clear();
+            }
+            foreach (var s in list)
+            {
+                s.Close();
+                Log.Debug("旧帧池 " + s.Size.Width + "×" + s.Size.Height + " 的帧已全部归还，已释放");
+            }
         }
 
         private void OnMssStarting(MediaStreamSource sender, MediaStreamSourceStartingEventArgs args)
         {
             // 等首帧到达再开始计时，避免把启动耗时算进视频开头
-            for (int i = 0; i < 120; i++)
+            var waited = System.Diagnostics.Stopwatch.StartNew();
+            while (waited.Elapsed < StartingFirstFrameWait)
             {
                 lock (_sync) { if (_lastFrame != null) break; }
-                Thread.Sleep(8);
+                if (IsCancelled) break;
+                Thread.Sleep(StartingPollMs);
             }
 
-            // 时间轴原点固定为 0，样本时间戳也用相对值——两边必须同一套基准，
-            // 之前一边用绝对系统时间、一边用相对时间，导致播放速度错乱。
-            _clock.Restart();
-            _nextSampleTime = TimeSpan.Zero;
+            lock (_sync)
+            {
+                var clock = _clock;
+                if (clock != null)
+                {
+                    clock.Reset();
+                    if (!_paused && !IsCancelled) clock.Start();
+                }
+                _nextSampleTime = TimeSpan.Zero;
+            }
 
             // 音频与视频必须共用这一个原点。音频采集启动得更早（否则会丢开头），
             // 那段预卷数据要在此刻丢掉，不然整条音轨会恒定超前于画面。
-            if (_audio != null) _audio.ResetTimeline();
+            var audio = _audio;
+            if (audio != null) audio.ResetTimeline();
 
             args.Request.SetActualStartPosition(TimeSpan.Zero);
         }
@@ -404,14 +696,15 @@ namespace ParaDesk.Recording
         {
             var request = args.Request;
 
-            if (_cts != null && _cts.IsCancellationRequested)
+            if (IsCancelled)
             {
                 request.Sample = null;   // null 表示流结束，Transcode 随之收尾
                 return;
             }
 
             // 音视频共用同一个回调，靠流描述符区分
-            if (_audioDescriptor != null && request.StreamDescriptor == _audioDescriptor)
+            var audioDescriptor = _audioDescriptor;
+            if (audioDescriptor != null && request.StreamDescriptor == audioDescriptor)
             {
                 SupplyAudio(request);
                 return;
@@ -424,16 +717,17 @@ namespace ParaDesk.Recording
                 // 这样输出时间轴严格等于真实流逝时间，不会忽快忽慢。
                 while (true)
                 {
-                    if (_cts == null || _cts.IsCancellationRequested) break;
-                    // 暂停时表停了，_clock.Elapsed 不再前进，这里自然一直等下去
-                    if (_paused) { Thread.Sleep(30); continue; }
-                    var wait = _nextSampleTime - _clock.Elapsed;
+                    if (IsCancelled) break;
+                    if (_paused) { Thread.Sleep(PausePollMs); continue; }
+                    var clock = _clock;
+                    if (clock == null) break;
+                    var wait = _nextSampleTime - clock.Elapsed;
                     if (wait <= TimeSpan.Zero) break;
-                    Thread.Sleep(wait > TimeSpan.FromMilliseconds(15)
-                        ? 15 : Math.Max(1, (int)wait.TotalMilliseconds));
+                    Thread.Sleep(wait > TimeSpan.FromMilliseconds(PacingSleepMaxMs)
+                        ? PacingSleepMaxMs : Math.Max(1, (int)wait.TotalMilliseconds));
                 }
 
-                if (_cts != null && _cts.IsCancellationRequested)
+                if (IsCancelled)
                 {
                     request.Sample = null;   // 只有真正停止时才结束流
                     return;
@@ -441,15 +735,15 @@ namespace ParaDesk.Recording
 
                 // 等首帧到来。绝不能用 Sample = null 表示"跳过一拍"——
                 // 对 MediaStreamSource 而言 null 就是流结束，录制会当场被截断。
-                // 只有真正取消时才允许交 null。
-                for (int i = 0; i < 600; i++)
+                var waited = System.Diagnostics.Stopwatch.StartNew();
+                while (waited.Elapsed < FirstFrameTimeout)
                 {
                     lock (_sync) { if (_lastFrame != null) break; }
-                    if (_cts == null || _cts.IsCancellationRequested) break;
-                    Thread.Sleep(10);
+                    if (IsCancelled) break;
+                    Thread.Sleep(FirstFramePollMs);
                 }
 
-                if (_cts != null && _cts.IsCancellationRequested)
+                if (IsCancelled)
                 {
                     request.Sample = null;
                     return;
@@ -467,7 +761,7 @@ namespace ParaDesk.Recording
                 lock (_sync)
                 {
                     used = _lastFrame;
-                    if (used != null)
+                    if (used != null && !_framesClosed)
                     {
                         sample = MediaStreamSample.CreateFromDirect3D11Surface(used.Surface, ts);
                         sample.Duration = _frameInterval;   // 不设时长编码器会按序排帧，导致画面加速
@@ -477,8 +771,10 @@ namespace ParaDesk.Recording
 
                 if (sample == null)
                 {
-                    // 等了 6 秒仍无帧：目标多半已经不再绘制，正常结束而不是死等
-                    Log.Warn("等待首帧超时，结束录制");
+                    if (IsCancelled) { request.Sample = null; return; }
+
+                    Log.Warn("等待首帧超时（" + FirstFrameTimeout.TotalSeconds + " 秒），以错误结束录制");
+                    EndWithError(L.T("录制目标没有产生画面（可能已最小化或被系统停止绘制）"));
                     request.Sample = null;
                     return;
                 }
@@ -487,14 +783,20 @@ namespace ParaDesk.Recording
                 var frameRef = used;
                 sample.Processed += delegate
                 {
-                    lock (_sync) { ReleaseFrameLocked(frameRef); }
+                    lock (_sync) { ReleaseSampleRefLocked(frameRef); }
+                    ScheduleClosePools();
                 };
 
                 request.Sample = sample;
             }
             catch (Exception ex)
             {
-                Log.Debug("供样失败: " + ex.Message);
+                if (!IsCancelled)
+                {
+                    Log.Warn("视频供样失败，结束录制: " + ex.Message);
+                    EndWithError(L.T("录制失败：") + ex.Message);
+                }
+                else Log.Debug("视频供样失败（已在停止）: " + ex.Message);
                 request.Sample = null;
             }
             finally { deferral.Complete(); }
@@ -509,21 +811,25 @@ namespace ParaDesk.Recording
             var deferral = request.GetDeferral();
             try
             {
-                if (_audio == null) { request.Sample = null; return; }
+                var audio = _audio;
+                if (audio == null) { request.Sample = null; return; }
 
                 // 暂停期间不取音频，否则恢复后音轨会比画面长出一截
-                while (_paused && _cts != null && !_cts.IsCancellationRequested) Thread.Sleep(30);
-                if (_cts != null && _cts.IsCancellationRequested) { request.Sample = null; return; }
+                while (_paused && !IsCancelled) Thread.Sleep(PausePollMs);
+                if (IsCancelled) { request.Sample = null; return; }
+
+                CheckAudioHealth(audio);
 
                 TimeSpan ts;
-                byte[] pcm = _audio.Read(AudioChunk, out ts);
+                byte[] pcm = audio.Read(AudioChunk, out ts);
 
                 // 音频不能跑到视频前面太多，否则编码器要缓存大量视频帧
-                var ahead = ts - _clock.Elapsed;
-                if (ahead > TimeSpan.FromMilliseconds(200))
+                var clock = _clock;
+                if (clock != null)
                 {
-                    int ms = (int)Math.Min(100, ahead.TotalMilliseconds);
-                    Thread.Sleep(ms);
+                    var ahead = ts - clock.Elapsed;
+                    if (ahead > AudioLeadLimit)
+                        Thread.Sleep((int)Math.Min(AudioLeadSleepMaxMs, ahead.TotalMilliseconds));
                 }
 
                 var buffer = System.Runtime.InteropServices.WindowsRuntime
@@ -534,10 +840,51 @@ namespace ParaDesk.Recording
             }
             catch (Exception ex)
             {
-                Log.Debug("音频供样失败: " + ex.Message);
+                if (!IsCancelled)
+                {
+                    Log.Warn("音频供样失败，之后的录制没有声音: " + ex.Message);
+                    ReportAudioFailure(ex.Message);
+                }
+                else Log.Debug("音频供样失败（已在停止）: " + ex.Message);
                 request.Sample = null;
             }
             finally { deferral.Complete(); }
+        }
+
+        private void CheckAudioHealth(AudioMixer audio)
+        {
+            if (Thread.VolatileRead(ref _audioFailedRaised) != 0) return;
+            string reason = audio.FailureReason;
+            if (reason != null) ReportAudioFailure(reason);
+        }
+
+        private void ReportAudioFailure(string reason)
+        {
+            if (Interlocked.CompareExchange(ref _audioFailedRaised, 1, 0) != 0) return;
+            Log.Warn("录制中音频采集中断，录制继续: " + reason);
+            AddWarning(L.T("中途失去声音：") + reason);
+
+            var h = AudioFailed;
+            if (h == null) return;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try { h(reason); }
+                catch (Exception ex) { Log.Error("音频中断回调异常", ex); }
+            });
+        }
+
+        private void AddWarning(string warning)
+        {
+            lock (_sync) _warnings.Add(warning);
+        }
+
+        private string BuildWarning()
+        {
+            lock (_sync)
+            {
+                if (_warnings.Count == 0) return null;
+                return string.Join(L.Current == "en" ? "; " : "；", _warnings.ToArray());
+            }
         }
 
         private void OnItemClosed(GraphicsCaptureItem sender, object args)
@@ -554,37 +901,92 @@ namespace ParaDesk.Recording
                 if (_state != RecorderState.Recording && _state != RecorderState.Starting) return;
                 _state = RecorderState.Stopping;
             }
-
-            try { if (_cts != null) _cts.Cancel(); } catch { }
-            try { if (_audio != null) _audio.Stop(); } catch { }
-            try { if (_session != null) _session.Dispose(); } catch { }
-            try { if (_pool != null) _pool.Dispose(); } catch { }
+            StopCore();
             Log.Info("已请求停止录制");
         }
 
-        private bool _finished;
+        private void StopCore()
+        {
+            var cts = _cts;
+            if (cts != null) CaptureHelpers.SafeRun(delegate { cts.Cancel(); }, "取消录制");
 
-        private void Finish(string error)
+            PoolSlot slot;
+            AudioMixer audio;
+            lock (_sync)
+            {
+                var clock = _clock;
+                if (clock != null) clock.Stop();
+                slot = _current;
+                audio = _audio;
+            }
+            if (audio != null) CaptureHelpers.SafeRun(audio.Stop, "停止音频采集");
+            if (slot != null) slot.StopSession();
+        }
+
+        private void EndWithError(string error)
+        {
+            lock (_sync)
+            {
+                if (_pendingError == null) _pendingError = error;
+            }
+            Stop();
+        }
+
+        private void Finish(string error, bool outputCreated)
         {
             lock (_sync)
             {
                 if (_finished) return;
                 _finished = true;
+                if (_pendingError != null) error = _pendingError;
+                if (_state == RecorderState.Recording || _state == RecorderState.Starting)
+                    _state = RecorderState.Stopping;
             }
 
-            var dur = DateTime.Now - _startedAt;
+            TimeSpan dur = TimeSpan.Zero;
             string path = _outputPath;
+            string warning = null;
+            try
+            {
+                StopCore();
 
-            CleanUp();
-            _state = RecorderState.Idle;
+                var clock = _clock;
+                if (clock != null) dur = clock.Elapsed;
+                warning = BuildWarning();
 
-            if (error == null) Log.Info("录制完成 " + path + "  时长 " + dur.ToString(@"hh\:mm\:ss"));
+                CleanUp();
+            }
+            catch (Exception ex) { Log.Error("录制收尾异常", ex); }
+            finally
+            {
+                lock (_sync) _state = RecorderState.Idle;
+                _finishedEvent.Set();
+            }
+
+            if (error == null)
+                Log.Info("录制完成 " + path + "  时长 " + dur.ToString(@"hh\:mm\:ss") +
+                         (warning != null ? "  提示: " + warning : ""));
             else Log.Warn("录制结束（有错误）: " + error);
+
+            bool startFailed;
+            lock (_sync) startFailed = _startFailed;
+            if (startFailed)
+            {
+                if (outputCreated && !string.IsNullOrEmpty(path))
+                {
+                    try { File.Delete(path); }
+                    catch (Exception ex) { Log.Debug("删除启动失败留下的空录像失败: " + ex.Message); }
+                }
+                Log.Debug("该录制器启动时已报错，不再触发 Stopped");
+                return;
+            }
 
             var h = Stopped;
             if (h != null)
             {
-                try { h(this, new RecordingStoppedEventArgs(path, error, dur)); }
+                var e = new RecordingStoppedEventArgs(path, error, dur);
+                if (error == null) e.Warning = warning;
+                try { h(this, e); }
                 catch (Exception ex) { Log.Error("录制完成回调异常", ex); }
             }
         }
@@ -606,43 +1008,59 @@ namespace ParaDesk.Recording
 
         private void CleanUpCore()
         {
-            try
+            var frames = new List<Direct3D11CaptureFrame>();
+            var slots = new List<PoolSlot>();
+            lock (_sync)
             {
-                lock (_sync)
-                {
-                    var last = _lastFrame;
-                    _lastFrame = null;
-                    // 先清在途表再释放，避免 ReleaseFrameLocked 因 _lastFrame 判断而漏放
-                    foreach (var kv in _inFlight)
-                    {
-                        try { kv.Key.Dispose(); } catch { }
-                    }
-                    _inFlight.Clear();
-                    if (last != null) { try { last.Dispose(); } catch { } }
-                }
+                _framesClosed = true;
+                var all = new HashSet<Direct3D11CaptureFrame>(_owner.Keys);
+                if (_lastFrame != null) all.Add(_lastFrame);
+                foreach (var f in _inFlight.Keys) all.Add(f);
+                frames.AddRange(all);
+                _owner.Clear();
+                _inFlight.Clear();
+                _lastFrame = null;
+
+                if (_current != null) slots.Add(_current);
+                slots.AddRange(_retired);
+                slots.AddRange(_closable);
+                _current = null;
+                _retired.Clear();
+                _closable.Clear();
             }
-            catch { }
-            try { if (_clock != null) { _clock.Stop(); _clock = null; } } catch { }
-            try { if (_audio != null) { _audio.Dispose(); _audio = null; } } catch { }
+            foreach (var f in frames) CaptureHelpers.SafeDispose(f, "释放捕获帧");
+
+            foreach (var s in slots) s.Close();
+
+            lock (_sync)
+            {
+                if (_clock != null) { _clock.Stop(); _clock = null; }
+            }
+
+            var audio = _audio;
+            _audio = null;
+            CaptureHelpers.SafeDispose(audio, "释放音频采集");
+
+            DetachMediaStreamSource();
+            _mss = null;
             _videoDescriptor = null;
             _audioDescriptor = null;
-            try { if (_session != null) { _session.Dispose(); _session = null; } } catch { }
-            try { if (_pool != null) { _pool.Dispose(); _pool = null; } } catch { }
-            try { if (_stream != null) { _stream.Dispose(); _stream = null; } } catch { }
-            try { if (_item != null) { _item.Closed -= OnItemClosed; _item = null; } } catch { }
-            _mss = null;
+
+            var stream = _stream;
+            _stream = null;
+            CaptureHelpers.SafeDispose(stream, "关闭输出文件");
+
+            var item = _item;
+            _item = null;
+            if (item != null) CaptureHelpers.SafeRun(delegate { item.Closed -= OnItemClosed; }, "解除目标关闭事件");
+
             _device = null;
+            CaptureHelpers.ReleaseNative(ref _nativeContext, " D3D11 上下文");
+            CaptureHelpers.ReleaseNative(ref _nativeDevice, " D3D11 设备");
 
-            try
-            {
-                if (_nativeContext != IntPtr.Zero)
-                { System.Runtime.InteropServices.Marshal.Release(_nativeContext); _nativeContext = IntPtr.Zero; }
-                if (_nativeDevice != IntPtr.Zero)
-                { System.Runtime.InteropServices.Marshal.Release(_nativeDevice); _nativeDevice = IntPtr.Zero; }
-            }
-            catch { }
-
-            try { if (_cts != null) { _cts.Dispose(); _cts = null; } } catch { }
+            var cts = _cts;
+            _cts = null;
+            CaptureHelpers.SafeDispose(cts, "释放取消令牌");
             // 注意：不要在这里复位 _finished。它是一次性录制的终态标记，
             // 复位会让 Finish 有机会重复触发 Stopped 事件。
         }
@@ -652,20 +1070,56 @@ namespace ParaDesk.Recording
             string dir = string.IsNullOrEmpty(options.OutputFolder)
                 ? RecordingOptions.DefaultFolder
                 : options.OutputFolder;
+            dir = Path.GetFullPath(dir);
 
             // 键不能用"录制"——那个词同时是导航项，两处英文不同，字典里会互相覆盖
-            string safe = target.Title ?? L.T("未命名录制");
-            foreach (char c in Path.GetInvalidFileNameChars()) safe = safe.Replace(c, '_');
-            if (safe.Length > 40) safe = safe.Substring(0, 40);
+            string safe = CaptureHelpers.SafeFileStem(target.Title, L.T("未命名录制"));
 
             string name = string.Format("{0}_{1:yyyyMMdd_HHmmss}.mp4", safe, DateTime.Now);
-            return Path.Combine(dir, name);
+            return CaptureHelpers.UniquePath(Path.Combine(dir, name));
         }
 
         public void Dispose()
         {
             Stop();
+            bool wait;
+            lock (_sync) wait = _pipelineStarted && !_finished;
+            if (wait && !_finishedEvent.Wait(DisposeFinishTimeout))
+                Log.Warn("录制在 " + DisposeFinishTimeout.TotalSeconds + " 秒内未能收尾，强制释放资源（文件可能不完整）");
             CleanUp();
+        }
+
+        private sealed class PoolSlot
+        {
+            public Direct3D11CaptureFramePool Pool;
+            public GraphicsCaptureSession Session;
+            public TypedEventHandler<Direct3D11CaptureFramePool, object> Handler;
+            public SizeInt32 Size;
+
+            public int Outstanding;
+            public volatile bool Retired;
+            public bool Queued;
+            public bool SwitchPending;
+            public SizeInt32 FailedResize;
+
+            private int _sessionStopped, _closed;
+
+            public void StopSession()
+            {
+                if (Interlocked.Exchange(ref _sessionStopped, 1) != 0) return;
+                CaptureHelpers.SafeDispose(Session, "停止捕获会话");
+            }
+
+            public void Close()
+            {
+                if (Interlocked.Exchange(ref _closed, 1) != 0) return;
+                StopSession();
+                var pool = Pool;
+                var handler = Handler;
+                if (pool != null && handler != null)
+                    CaptureHelpers.SafeRun(delegate { pool.FrameArrived -= handler; }, "解除帧到达事件");
+                CaptureHelpers.SafeDispose(pool, "释放帧池");
+            }
         }
     }
 }

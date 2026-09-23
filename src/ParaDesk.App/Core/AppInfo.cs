@@ -11,7 +11,6 @@ namespace ParaDesk.Core
         public const string ProductNameZh = "分身桌面";
         public const string Tagline = "给你的电脑开分身";
 
-        /// <summary>单实例互斥体名。用 Global 前缀，使子会话内再次启动也会被拦下。</summary>
         public const string MutexNameGlobal = "Global\\ParaDeskSingleInstance";
         public const string MutexNameLocal = "Local\\ParaDeskSingleInstance";
 
@@ -29,21 +28,38 @@ namespace ParaDesk.Core
             get { return ProductName + " " + ProductNameZh; }
         }
 
-        /// <summary>用户数据目录（日志、设置）。</summary>
+        public static string DisplayTitle
+        {
+            get { return L.T(Title); }
+        }
+
+        private static string _dataDir;
+
         public static string DataDir
         {
             get
             {
-                string d = Path.Combine(
+                string d = _dataDir;
+                if (d != null) return d;
+
+                d = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                     ProductName);
-                try { Directory.CreateDirectory(d); } catch { }
+                try
+                {
+                    Directory.CreateDirectory(d);
+                    _dataDir = d;
+                }
+                catch (Exception)
+                {
+                }
                 return d;
             }
         }
 
         public static string SettingsPath { get { return Path.Combine(DataDir, "settings.json"); } }
-        public static string LogPath { get { return Path.Combine(DataDir, "paradesk.log"); } }
+
+        public static string LogPath { get { return Log.Path0; } }
 
         public static string ExecutablePath
         {

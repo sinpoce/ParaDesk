@@ -26,6 +26,21 @@ namespace ParaDesk.Diagnostics
     /// </summary>
     internal static class ContentTest
     {
+        private const double PhaseSeconds = 3.0;
+
+        private const int ColorTolerance = 150;
+
+        private const int ThumbWidth = 160;
+        private const int ThumbHeight = 90;
+
+        private const int RedrawIntervalMs = 30;
+
+        private const int StopTimeoutSeconds = 30;
+
+        private const int WinRtTimeoutSeconds = 10;
+
+        private const int WinRtDecodeTimeoutSeconds = 20;
+
         private static void Say(string msg)
         {
             Console.WriteLine(msg);
@@ -57,14 +72,20 @@ namespace ParaDesk.Diagnostics
             if (!Shell.WpfHost.Initialize()) { Say("WPF 宿主初始化失败"); return 2; }
             Say("宿主就绪，准备测试窗口…");
 
-            // 每段 3 秒，颜色差异极大，抽帧时容错空间足够
             var phases = new List<Phase>
             {
-                new Phase { Name = "红", Color = Color.FromRgb(220, 30, 30),  StartSec = 0, EndSec = 3 },
-                new Phase { Name = "绿", Color = Color.FromRgb(30, 190, 60),  StartSec = 3, EndSec = 6 },
-                new Phase { Name = "蓝", Color = Color.FromRgb(40, 90, 220),  StartSec = 6, EndSec = 9 },
+                new Phase { Name = "红", Color = Color.FromRgb(220, 30, 30),  StartSec = 0,                EndSec = PhaseSeconds },
+                new Phase { Name = "绿", Color = Color.FromRgb(30, 190, 60),  StartSec = PhaseSeconds,     EndSec = PhaseSeconds * 2 },
+                new Phase { Name = "蓝", Color = Color.FromRgb(40, 90, 220),  StartSec = PhaseSeconds * 2, EndSec = PhaseSeconds * 3 },
             };
             double total = phases[phases.Count - 1].EndSec;
+
+            int minGap = MinPhaseDistance(phases);
+            if (minGap <= ColorTolerance)
+            {
+                Say("自检配置错误：两段颜色的最小距离 " + minGap + " 不大于容差 " + ColorTolerance + "，无法区分串帧");
+                return 1;
+            }
 
             var target = MonitorService.DefaultTarget();
             if (target == null) { Say("找不到显示器"); return 2; }
@@ -105,44 +126,47 @@ namespace ParaDesk.Diagnostics
                 Title = "内容校验",
             };
 
-            var recorder = new ScreenRecorder();
             string file = null, error = null;
+            bool finished;
             var done = new ManualResetEventSlim(false);
-            recorder.Stopped += delegate(object s, RecordingStoppedEventArgs e)
+            using (var recorder = new ScreenRecorder())
             {
-                file = e.FilePath; error = e.Error; done.Set();
-            };
-
-            Say("录制 " + total + " 秒的三段纯色（红→绿→蓝）…");
-            string err = recorder.Start(captureTarget, options);
-            if (err != null) { Say("启动失败: " + err); win.Close(); return 1; }
-
-            // 按计划切换颜色；用 WPF 调度器切换才能真正触发重绘
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            int current = 0;
-            while (sw.Elapsed.TotalSeconds < total)
-            {
-                double t = sw.Elapsed.TotalSeconds;
-                int want = 0;
-                for (int i = 0; i < phases.Count; i++)
-                    if (t >= phases[i].StartSec) want = i;
-
-                if (want != current)
+                recorder.Stopped += delegate(object s, RecordingStoppedEventArgs e)
                 {
-                    current = want;
-                    var c = phases[want].Color;
-                    win.Dispatcher.Invoke((Action)delegate
-                    {
-                        win.Background = new SolidColorBrush(c);
-                    });
-                }
-                // 让窗口持续重绘，确保 WGC 有帧可送
-                win.Dispatcher.Invoke(DispatcherPriority.Render, (Action)delegate { win.InvalidateVisual(); });
-                Thread.Sleep(30);
-            }
+                    file = e.FilePath; error = e.Error; done.Set();
+                };
 
-            recorder.Stop();
-            bool finished = done.Wait(TimeSpan.FromSeconds(30));
+                Say("录制 " + total + " 秒的三段纯色（红→绿→蓝）…");
+                string err = recorder.Start(captureTarget, options);
+                if (err != null) { Say("启动失败: " + err); win.Close(); return 1; }
+
+                // 按计划切换颜色；用 WPF 调度器切换才能真正触发重绘
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                int current = 0;
+                while (sw.Elapsed.TotalSeconds < total)
+                {
+                    double t = sw.Elapsed.TotalSeconds;
+                    int want = 0;
+                    for (int i = 0; i < phases.Count; i++)
+                        if (t >= phases[i].StartSec) want = i;
+
+                    if (want != current)
+                    {
+                        current = want;
+                        var c = phases[want].Color;
+                        win.Dispatcher.Invoke((Action)delegate
+                        {
+                            win.Background = new SolidColorBrush(c);
+                        });
+                    }
+                    // 让窗口持续重绘，确保 WGC 有帧可送
+                    win.Dispatcher.Invoke(DispatcherPriority.Render, (Action)delegate { win.InvalidateVisual(); });
+                    Thread.Sleep(RedrawIntervalMs);
+                }
+
+                recorder.Stop();
+                finished = done.Wait(TimeSpan.FromSeconds(StopTimeoutSeconds));
+            }
             win.Dispatcher.Invoke((Action)delegate { win.Close(); });
 
             if (!finished) { Say("停止超时"); return 1; }
@@ -159,10 +183,10 @@ namespace ParaDesk.Diagnostics
             try
             {
                 var fileTask = StorageFile.GetFileFromPathAsync(path).AsTask();
-                fileTask.Wait(TimeSpan.FromSeconds(10));
+                fileTask.Wait(TimeSpan.FromSeconds(WinRtTimeoutSeconds));
 
                 var clipTask = MediaClip.CreateFromFileAsync(fileTask.Result).AsTask();
-                clipTask.Wait(TimeSpan.FromSeconds(20));
+                clipTask.Wait(TimeSpan.FromSeconds(WinRtDecodeTimeoutSeconds));
 
                 var composition = new MediaComposition();
                 composition.Clips.Add(clipTask.Result);
@@ -179,15 +203,11 @@ namespace ParaDesk.Diagnostics
                         continue;
                     }
 
-                    // H.264 有损压缩 + 色彩空间转换，允许较宽容差；
-                    // 这里只判断"主色调是否正确"，不是精确比色
-                    int d = Math.Abs(got.Value.R - ph.Color.R)
-                          + Math.Abs(got.Value.G - ph.Color.G)
-                          + Math.Abs(got.Value.B - ph.Color.B);
-                    bool ok = d < 150;
-                    Say(string.Format("  {0,-4} @{1:N1}s  期望 #{2:X2}{3:X2}{4:X2}  实际 #{5:X2}{6:X2}{7:X2}  {8}",
+                    int d = Distance(got.Value, ph.Color);
+                    bool ok = d < ColorTolerance;
+                    Say(string.Format("  {0,-4} @{1:N1}s  期望 #{2:X2}{3:X2}{4:X2}  实际 #{5:X2}{6:X2}{7:X2}  距离 {8}  {9}",
                         ph.Name, mid, ph.Color.R, ph.Color.G, ph.Color.B,
-                        got.Value.R, got.Value.G, got.Value.B, ok ? "通过" : "不符"));
+                        got.Value.R, got.Value.G, got.Value.B, d, ok ? "通过" : "不符"));
                     if (ok) pass++; else fail++;
                 }
 
@@ -209,24 +229,38 @@ namespace ParaDesk.Diagnostics
             }
         }
 
+        private static int Distance(Color a, Color b)
+        {
+            return Math.Abs(a.R - b.R) + Math.Abs(a.G - b.G) + Math.Abs(a.B - b.B);
+        }
+
+        private static int MinPhaseDistance(List<Phase> phases)
+        {
+            int min = int.MaxValue;
+            for (int i = 0; i < phases.Count; i++)
+                for (int j = i + 1; j < phases.Count; j++)
+                    min = Math.Min(min, Distance(phases[i].Color, phases[j].Color));
+            return min;
+        }
+
         /// <summary>取指定时刻的缩略图并读取中心区域的平均色。</summary>
         private static Color? GrabColor(MediaComposition composition, double seconds)
         {
             try
             {
                 var thumbTask = composition.GetThumbnailAsync(
-                    TimeSpan.FromSeconds(seconds), 160, 90,
+                    TimeSpan.FromSeconds(seconds), ThumbWidth, ThumbHeight,
                     VideoFramePrecision.NearestFrame).AsTask();
-                thumbTask.Wait(TimeSpan.FromSeconds(20));
+                thumbTask.Wait(TimeSpan.FromSeconds(WinRtDecodeTimeoutSeconds));
 
                 using (var stream = thumbTask.Result)
                 {
                     var decoderTask = Windows.Graphics.Imaging.BitmapDecoder
                         .CreateAsync(stream).AsTask();
-                    decoderTask.Wait(TimeSpan.FromSeconds(10));
+                    decoderTask.Wait(TimeSpan.FromSeconds(WinRtTimeoutSeconds));
 
                     var pixelTask = decoderTask.Result.GetPixelDataAsync().AsTask();
-                    pixelTask.Wait(TimeSpan.FromSeconds(10));
+                    pixelTask.Wait(TimeSpan.FromSeconds(WinRtTimeoutSeconds));
 
                     byte[] pixels = pixelTask.Result.DetachPixelData();
                     int w = (int)decoderTask.Result.PixelWidth;

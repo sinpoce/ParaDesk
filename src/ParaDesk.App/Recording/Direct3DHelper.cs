@@ -23,7 +23,7 @@ namespace ParaDesk.Recording
         [DllImport("d3d11.dll", EntryPoint = "CreateDirect3D11DeviceFromDXGIDevice",
             SetLastError = true, CharSet = CharSet.Unicode, ExactSpelling = true,
             PreserveSig = false)]
-        private static extern uint CreateDirect3D11DeviceFromDXGIDevice(
+        private static extern void CreateDirect3D11DeviceFromDXGIDevice(
             IntPtr dxgiDevice, out IntPtr graphicsDevice);
 
         [DllImport("d3d11.dll", SetLastError = true, ExactSpelling = true)]
@@ -37,16 +37,19 @@ namespace ParaDesk.Recording
         private const uint D3D11_CREATE_DEVICE_BGRA_SUPPORT = 0x20;
         private const uint D3D11_SDK_VERSION = 7;
 
+        private static readonly Guid IidDxgiDevice = new Guid("54ec77fa-1377-44e6-8c32-88fd5f44c84c");
+
         /// <summary>创建可供 WinRT 捕获使用的 D3D11 设备；失败返回 null。</summary>
         public static IDirect3DDevice CreateDevice(out IntPtr nativeDevice, out IntPtr nativeContext)
         {
             nativeDevice = IntPtr.Zero;
             nativeContext = IntPtr.Zero;
+            int featureLevel;
 
             // BGRA 支持是必需的：捕获帧是 B8G8R8A8 格式
             int hr = D3D11CreateDevice(IntPtr.Zero, D3D_DRIVER_TYPE_HARDWARE, IntPtr.Zero,
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT, IntPtr.Zero, 0, D3D11_SDK_VERSION,
-                out nativeDevice, out _, out nativeContext);
+                out nativeDevice, out featureLevel, out nativeContext);
 
             if (hr < 0)
             {
@@ -54,7 +57,7 @@ namespace ParaDesk.Recording
                 Log.Warn("硬件 D3D11 设备创建失败 (0x" + hr.ToString("X8") + ")，回退 WARP");
                 hr = D3D11CreateDevice(IntPtr.Zero, D3D_DRIVER_TYPE_WARP, IntPtr.Zero,
                     D3D11_CREATE_DEVICE_BGRA_SUPPORT, IntPtr.Zero, 0, D3D11_SDK_VERSION,
-                    out nativeDevice, out _, out nativeContext);
+                    out nativeDevice, out featureLevel, out nativeContext);
                 if (hr < 0)
                 {
                     Log.Error("D3D11 设备创建失败 0x" + hr.ToString("X8"));
@@ -66,8 +69,8 @@ namespace ParaDesk.Recording
             IntPtr inspectable = IntPtr.Zero;
             try
             {
-                Guid iidDxgiDevice = new Guid("54ec77fa-1377-44e6-8c32-88fd5f44c84c"); // IDXGIDevice
-                int qi = Marshal.QueryInterface(nativeDevice, ref iidDxgiDevice, out dxgiDevice);
+                Guid iid = IidDxgiDevice;
+                int qi = Marshal.QueryInterface(nativeDevice, ref iid, out dxgiDevice);
                 if (qi < 0)
                 {
                     Log.Error("QueryInterface(IDXGIDevice) 失败 0x" + qi.ToString("X8"));
@@ -94,17 +97,15 @@ namespace ParaDesk.Recording
             }
             finally
             {
-                if (dxgiDevice != IntPtr.Zero) Marshal.Release(dxgiDevice);
-                if (inspectable != IntPtr.Zero) Marshal.Release(inspectable);
+                CaptureHelpers.ReleaseNative(ref dxgiDevice, " IDXGIDevice ");
+                CaptureHelpers.ReleaseNative(ref inspectable, " IInspectable ");
             }
         }
 
         private static void ReleaseOut(ref IntPtr device, ref IntPtr context)
         {
-            try { if (context != IntPtr.Zero) { Marshal.Release(context); context = IntPtr.Zero; } }
-            catch { }
-            try { if (device != IntPtr.Zero) { Marshal.Release(device); device = IntPtr.Zero; } }
-            catch { }
+            CaptureHelpers.ReleaseNative(ref context, " D3D11 上下文");
+            CaptureHelpers.ReleaseNative(ref device, " D3D11 设备");
         }
     }
 }

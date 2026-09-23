@@ -61,12 +61,55 @@ namespace ParaDesk.Diagnostics
             sb.AppendLine("空译文             = " + empty);
             problems += empty;
 
+            List<string> dupes;
+            string dupError = CollectExactDuplicates(out dupes);
+            if (dupError != null)
+            {
+                sb.AppendLine("完全重复（信息）   = 无法统计：" + dupError);
+            }
+            else
+            {
+                sb.AppendLine("完全重复（信息）   = " + dupes.Count);
+                foreach (string d in dupes) sb.AppendLine("  重复: " + Trim(d));
+            }
+
             sb.AppendLine(problems == 0 ? "结果               = 通过" : "结果               = 有问题");
 
             string text = sb.ToString();
             Console.Write(text);
-            Log.Info(text.TrimEnd());
+            Log.Info("[i18n] " + text.TrimEnd());
             return problems == 0 ? 0 : 1;
+        }
+
+        private static string CollectExactDuplicates(out List<string> dupes)
+        {
+            dupes = new List<string>();
+            try
+            {
+                var first = new Dictionary<string, string>(StringComparer.Ordinal);
+                var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+                var order = new List<string>();
+                Action<string, string> add = delegate(string zh, string en)
+                {
+                    if (zh == null) return;
+                    string prev;
+                    if (!first.TryGetValue(zh, out prev)) { first[zh] = en; return; }
+                    if (!string.Equals(prev, en, StringComparison.Ordinal)) return;
+                    int n;
+                    counts.TryGetValue(zh, out n);
+                    if (n == 0) order.Add(zh);
+                    counts[zh] = n + 1;
+                };
+                L.EnumerateEntries(add);
+
+                foreach (string zh in order)
+                    dupes.Add(zh + (counts[zh] > 1 ? "（×" + (counts[zh] + 1) + "）" : ""));
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return ex.GetType().Name + ": " + ex.Message;
+            }
         }
 
         private static List<int> Slots(string s)

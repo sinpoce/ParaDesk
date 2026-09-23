@@ -49,17 +49,23 @@ namespace ParaDesk.Core
                 NameOf(m), m.Bounds.Width, m.Bounds.Height);
         }
 
-        /// <summary>
-        /// 改名。传空或与「显示器 N」相同则视为清除自定义名，不留空条目。
-        /// 返回是否有实际改动，调用方据此决定要不要落盘。
-        /// </summary>
+        public const int MaxNameLength = 40;
+
+        public static string FindDeviceByName(string name)
+        {
+            if (_settings == null || _settings.MonitorNames == null || string.IsNullOrEmpty(name)) return null;
+            foreach (var n in _settings.MonitorNames)
+                if (n != null && string.Equals(n.Name, name.Trim(), StringComparison.OrdinalIgnoreCase)) return n.Device;
+            return null;
+        }
+
         public static bool Rename(string device, string name)
         {
             if (_settings == null || string.IsNullOrEmpty(device)) return false;
             if (_settings.MonitorNames == null) _settings.MonitorNames = new List<MonitorName>();
 
             name = (name ?? "").Trim();
-            if (name.Length > 40) name = name.Substring(0, 40);
+            if (name.Length > MaxNameLength) name = name.Substring(0, MaxNameLength).TrimEnd();
 
             for (int i = 0; i < _settings.MonitorNames.Count; i++)
             {

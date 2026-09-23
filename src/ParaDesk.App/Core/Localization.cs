@@ -12,7 +12,7 @@ namespace ParaDesk.Core
     /// 字符串量可控。这里用内嵌字典 + 运行时查表，切换语言无需重启，
     /// 也不给发行包增加任何文件。将来语言变多再迁 resx 不迟。
     /// </summary>
-    internal static class L
+    internal static partial class L
     {
         private static Dictionary<string, string> _map;
         private static string _lang = "zh";
@@ -22,15 +22,22 @@ namespace ParaDesk.Core
 
         public static event EventHandler Changed;
 
+        private static readonly CultureInfo SystemUiCulture = CultureInfo.CurrentUICulture;
+
         /// <summary>lang 传 "auto" 时跟随系统语言。</summary>
         public static void Apply(string lang)
+        {
+            Apply(lang, true);
+        }
+
+        public static void Apply(string lang, bool writeLog)
         {
             string resolved = lang;
             if (string.IsNullOrEmpty(lang) || lang == "auto")
             {
                 try
                 {
-                    var name = CultureInfo.CurrentUICulture.TwoLetterISOLanguageName;
+                    var name = SystemUiCulture.TwoLetterISOLanguageName;
                     resolved = name == "zh" ? "zh" : "en";
                 }
                 catch { resolved = "zh"; }
@@ -47,7 +54,7 @@ namespace ParaDesk.Core
             }
             catch { }
 
-            Log.Info("界面语言 => " + resolved);
+            if (writeLog) Log.Info("界面语言 => " + resolved);
             var h = Changed;
             if (h != null) h(null, EventArgs.Empty);
         }
@@ -88,6 +95,11 @@ namespace ParaDesk.Core
             return BuildEnglish();
         }
 
+        internal static void EnumerateEntries(Action<string, string> visitor)
+        {
+            if (visitor != null) BuildEnglish(visitor);
+        }
+
         private static Dictionary<string, string> BuildEnglish()
         {
             var d = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -95,11 +107,34 @@ namespace ParaDesk.Core
             return d;
         }
 
-        // 条目只写一份，由回调决定是"填字典"还是"查冲突"——
-        // 分成两份列表迟早会漂移，那时校验就成了摆设。
+        static partial void AddCli(Action<string, string> Add);
+        static partial void AddAppContext(Action<string, string> Add);
+        static partial void AddRdp(Action<string, string> Add);
+        static partial void AddTray(Action<string, string> Add);
+        static partial void AddRecording(Action<string, string> Add);
+        static partial void AddMainWindow(Action<string, string> Add);
+        static partial void AddWpfMisc(Action<string, string> Add);
+        static partial void AddDiag(Action<string, string> Add);
+        static partial void AddCore(Action<string, string> Add);
+        static partial void AddSetup(Action<string, string> Add);
+
         private static void BuildEnglish(Action<string, string> Add)
         {
+            AddCli(Add);
+            AddAppContext(Add);
+            AddRdp(Add);
+            AddTray(Add);
+            AddRecording(Add);
+            AddMainWindow(Add);
+            AddWpfMisc(Add);
+            AddDiag(Add);
+            AddCore(Add);
+            AddSetup(Add);
+            BuildEnglishBase(Add);
+        }
 
+        private static void BuildEnglishBase(Action<string, string> Add)
+        {
                 // 导航
                 Add("桌面", "Desktop");
                 Add("画面", "Display");
@@ -116,7 +151,6 @@ namespace ParaDesk.Core
                 Add("环境检查", "Environment check");
                 Add("日志与反馈", "Logs & feedback");
                 Add("运行日志", "Activity log");
-                Add("诊断包", "Diagnostic bundle");
                 Add("使用引导", "Guided setup");
                 Add("键鼠归谁、以及与主桌面之间怎么协作", "Who owns input, and how the two desktops share");
                 Add("在任何程序里都能用，不必先切回本窗口", "Works from any app — no need to come back here");
@@ -152,7 +186,6 @@ namespace ParaDesk.Core
                 Add("方案", "Profile");
 
                 // 显示设置
-                Add("显示设置", "Display settings");
                 Add("窗口模式", "Window mode");
                 Add("缩放", "Scale");
                 Add("仅查看", "View only");
@@ -234,7 +267,7 @@ namespace ParaDesk.Core
                 // 托盘
                 Add("打开主界面(&O)", "&Open");
                 Add("启动桌面(&S)", "&Start desktop");
-                Add("重新接入桌面(&S)", "&Reattach desktop");
+                Add("重新接入桌面(&S)", "Re&attach desktop");
                 Add("收起（后台保持运行）(&H)", "&Hide (keep running)");
                 Add("关闭桌面(&C)", "&Close desktop");
                 Add("仅查看（不响应我的键鼠）(&V)", "&View only");
@@ -284,8 +317,6 @@ namespace ParaDesk.Core
                     "Must include Ctrl / Alt / Shift / Win; press Backspace to clear. A registration failure means another program already owns that combination.");
 
                 // 设置
-                Add("程序自身的行为，与分身桌面无关",
-                    "How the app itself behaves — unrelated to the parallel desktop");
 
                 // 诊断
                 Add("INFO 以上", "INFO and above");
@@ -304,9 +335,6 @@ namespace ParaDesk.Core
                 Add("分身桌面用的是你同一个 Windows 账户：软件、文件、浏览器登录状态、AI 的记忆和工作进度全部通用，不需要来回传文件。代价是它不做安全隔离——那边能访问你所有文件，和你自己在主桌面操作的权限一样。",
                     "The parallel desktop runs under your same Windows account: apps, files, browser sign-ins, and your AI's memory and work in progress all carry over, with no copying files back and forth. The trade-off is that it provides no security isolation — that side reaches every file you can, with exactly your permissions.");
                 Add("需要 Windows 专业版及以上", "Requires Windows Pro or higher");
-                Add("一次性配置", "One-time setup");
-                Add("• 启用 Windows 子会话功能\n• 启用远程桌面监听器（子会话的必要前置条件，走本机回环、不经过网络）\n• 开放对应的防火墙规则\n• 允许委派默认凭据，这样以后不必每次输入密码\n• 将远程桌面服务设为自动启动",
-                    "• Enable Windows child sessions\n• Enable the Remote Desktop listener (required by child sessions; loopback only, never over the network)\n• Open the matching firewall rules\n• Allow delegating default credentials so you don't type a password each time\n• Set the Remote Desktop service to start automatically");
                 Add("选择显示位置", "Choose where it appears");
                 Add("点一下要让分身桌面出现的那块屏幕。分不清哪块是哪块时，点“识别屏幕”。",
                     "Click the screen where the parallel desktop should appear. If you can't tell them apart, press Identify.");
@@ -314,8 +342,6 @@ namespace ParaDesk.Core
                 Add("接下来就可以启动分身桌面了。几个值得先知道的点：",
                     "You can start the parallel desktop now. A few things worth knowing first:");
                 Add("常用操作", "Everyday use");
-                Add("• Ctrl+Alt+D 显示 / 收起分身桌面\n• Ctrl+Alt+V 切换“仅查看”（锁住你的键鼠，防止误触）\n• Ctrl+Alt+R 开始 / 停止录制\n• 关闭主窗口只是收进托盘，程序继续在后台运行",
-                    "• Ctrl+Alt+D show / hide the parallel desktop\n• Ctrl+Alt+V toggle view only (locks your input so you can't disturb it)\n• Ctrl+Alt+R start / stop recording\n• Closing the main window only tucks it into the tray; the app keeps running");
                 Add("必须知道的几点限制", "Limits worth knowing");
                 Add("• 系统同时只允许一个分身桌面，这是 Windows 的限制\n• 剪贴板默认与主桌面共享；同一份浏览器配置不能两边同开，可在“显示”页一键生成独立配置的快捷方式\n• 重启电脑前请先“关闭桌面”",
                     "• Only one parallel desktop can exist at a time — a Windows limitation\n• The clipboard is shared with the main desktop by default; one browser profile can't run on both sides, but Input & sharing can create a shortcut with its own profile\n• Always Close desktop before restarting the PC");
@@ -335,8 +361,6 @@ namespace ParaDesk.Core
                 Add("录制完成", "Recording finished");
                 Add("录制未成功", "Recording did not finish");
                 Add("有热键注册失败", "A hotkey failed to register");
-                Add("该组合可能已被其它程序占用，请换一个。",
-                    "Another program probably owns that combination — try a different one.");
                 Add("热键已生效", "Hotkeys are active");
                 Add("现在可以在任何程序里使用这些组合键。",
                     "You can now use these combinations from any app.");
@@ -350,9 +374,6 @@ namespace ParaDesk.Core
                 Add("有几项需要配置", "A few things need configuring");
                 Add("配置完成", "Setup complete");
                 Add("需要重启电脑", "A restart is required");
-                Add("已取消", "Cancelled");
-                Add("配置未完成", "Setup didn't finish");
-                Add("详见日志：", "See the log: ");
 
                 // 日志窗口
                 Add("（暂无日志）", "(no log yet)");
@@ -379,7 +400,6 @@ namespace ParaDesk.Core
                 Add("显示器", "Monitor");
                 Add("窗口", "Window");
                 Add("主屏", "primary");
-                Add("，主屏", ", primary");
                 Add("（主屏）", " (primary)");
                 Add("显示器 {0}", "Monitor {0}");
                 Add("显示器 {0}: {1}  {2}×{3}{4}", "Monitor {0}: {1}  {2}×{3}{4}");
@@ -409,7 +429,6 @@ namespace ParaDesk.Core
                 Add("家庭版不支持子会话功能", "Home edition has no child sessions");
                 Add("远程桌面客户端控件", "Remote Desktop client control");
                 Add("已就绪", "Ready");
-                Add("系统组件缺失", "System component missing");
                 Add("系统组件缺失，无法运行", "System component missing — can't run");
                 Add("子会话功能", "Child sessions");
                 Add("远程桌面监听器", "Remote Desktop listener");
@@ -426,7 +445,6 @@ namespace ParaDesk.Core
                 Add("配置完成后需重启电脑一次才会就绪", "Ready after one restart following setup");
                 Add("Windows 家庭版不含子会话功能，需要专业版及以上。分身桌面与沙盒桌面都用不了，录制和截图仍可正常使用。",
                     "Windows Home has no child sessions — Pro or higher is required. Neither the parallel desktop nor the sandbox desktop is available; recording and screenshots still work.");
-                Add("系统缺少远程桌面客户端控件。", "The Remote Desktop client control is missing.");
                 Add("系统 {0} (build {1})　子会话 {2}　监听器 {3}",
                     "{0} (build {1})　Child sessions {2}　Listener {3}");
 
@@ -528,7 +546,6 @@ namespace ParaDesk.Core
                 Add("录制中", "Recording");
                 Add("录制中的目标：", "Recording: ");
                 Add("请先选择录制目标。", "Pick a capture target first.");
-                Add("请先选择截图目标。", "Pick a screenshot target first.");
                 Add("选择录制文件的保存位置", "Choose where recordings are saved");
                 Add("无法使用该文件夹：", "That folder can't be used: ");
                 Add("没有可录制的目标。", "There's nothing available to record.");
@@ -604,7 +621,6 @@ namespace ParaDesk.Core
                 Add("已收起（后台运行）", "Hidden (running in background)");
                 Add("（无匹配内容）", "(nothing matches)");
                 Add("{0} / {1} 行", "{0} of {1} lines");
-                Add("确定清空日志文件吗？", "Clear the log file?");
                 Add("清空失败：", "Couldn't clear it: ");
 
                 // ---- 「画面」页：目标显示器与作用域 ----
@@ -625,11 +641,8 @@ namespace ParaDesk.Core
                     "30 FPS by default. Needs administrator approval and a restart.");
                 Add("同一份浏览器配置不能两边同开，用独立配置的快捷方式绕开",
                     "One browser profile can't run on both sides — use a shortcut with its own profile");
-                Add("越高越清晰，文件也越大", "Higher is sharper, and bigger");
                 Add("窗口被遮挡也不影响录制内容。", "Covering the window doesn't affect the recording.");
                 Add("未选目标时自动录分身桌面", "Records the parallel desktop when no target is picked");
-                Add("Language — 切换后立即生效", "语言 — takes effect immediately");
-                Add("登录后自动在托盘运行", "Runs in the tray after you sign in");
                 Add("「启动桌面」会自动配置。仅在系统更新或组策略改回设置时才需要手动修复。",
                     "Start desktop configures things automatically. Only needed to repair after a Windows update or group policy reverts them.");
 
@@ -667,7 +680,6 @@ namespace ParaDesk.Core
                 Add("{0}（已断开）", "{0} (disconnected)");
                 Add("{0} 已断开。", "{0} is disconnected.");
 
-
                 // ---- 「画面」页：全局设置分节 ----
 
                 Add("全局设置", "System-wide");
@@ -696,7 +708,6 @@ namespace ParaDesk.Core
                 // 提权配置进程（独立进程，自己加载语言）
                 Add("启用子会话", "Enable child sessions");
                 Add("启用远程桌面监听器", "Enable the Remote Desktop listener");
-                Add("开放防火墙远程桌面规则", "Open the Remote Desktop firewall rules");
                 Add("允许委派默认凭据（免除重复输入密码）",
                     "Allow delegating default credentials (no repeated password prompts)");
                 Add("TermService 设为自动启动", "Set TermService to start automatically");
@@ -725,8 +736,6 @@ namespace ParaDesk.Core
                 Add("启用沙盒功能失败，详见日志。", "Couldn't enable Sandbox — see the log.");
                 Add("同时会关掉跨设备恢复，并挡掉它在分身桌面里弹的那个系统错误框。",
                     "It also turns off Cross Device Resume and suppresses the system error dialog it raises inside the parallel desktop.");
-                Add("• 启用 Windows 子会话功能\n• 启用远程桌面监听器（子会话的必要前置条件，走本机回环、不经过网络）\n• 开放对应的防火墙规则\n• 允许委派默认凭据，这样以后不必每次输入密码\n• 将远程桌面服务设为自动启动\n• 关掉跨设备恢复，并挡掉它在分身桌面里弹的系统错误框",
-                    "• Enable Windows child sessions\n• Enable the Remote Desktop listener (required by child sessions; loopback only, never over the network)\n• Open the matching firewall rules\n• Allow delegating default credentials so you don't type a password each time\n• Set the Remote Desktop service to start automatically\n• Turn off Cross Device Resume and suppress the system error dialog it raises inside the parallel desktop");
                 Add("启动桌面时自动启用", "Enabled when you start the desktop");
                 Add("启动桌面时自动启动", "Started when you start the desktop");
                 Add("不用在这里操作——第一次点「启动桌面」时会一次性配置好，只需一次管理员授权。",
@@ -738,7 +747,6 @@ namespace ParaDesk.Core
                 Add("重新走一遍首次运行的引导", "Walk through the first-run guide again");
 
                 // ---- 跨设备功能冲突 ----
-                Add("系统错误框", "System error dialog");
                 Add("打开凭据对话框失败，详见日志。", "Couldn't open the credentials dialog — see the log.");
                 Add("请填写账户名。", "Enter an account name.");
                 Add("保存失败，详见日志。", "Save failed — see the log.");

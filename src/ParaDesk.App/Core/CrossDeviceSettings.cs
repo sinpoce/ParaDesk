@@ -19,8 +19,9 @@ namespace ParaDesk.Core
     /// </summary>
     internal static class CrossDeviceSettings
     {
-        private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string ValueName = "ParaDeskChildAgent";
+
+        private const string AgentArgs = "--childagent";
 
         /// <summary>「跨设备恢复」的用户级开关。</summary>
         private const string ResumeKey =
@@ -30,15 +31,20 @@ namespace ParaDesk.Core
         private const string LegacyIfeoKey =
             @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\CrossDeviceResume.exe";
 
+        public static bool RepairIfStale()
+        {
+            return RunKeyStore.RepairIfStale(ValueName, "子会话守护");
+        }
+
+        public static bool EnsureAgentRegistered()
+        {
+            if (IsEnabled()) return true;
+            return Apply(true) && IsEnabled();
+        }
+
         public static bool IsEnabled()
         {
-            try
-            {
-                using (var k = Registry.CurrentUser.OpenSubKey(RunKey))
-                {
-                    return k != null && k.GetValue(ValueName) != null;
-                }
-            }
+            try { return RunKeyStore.Exists(ValueName) && RunKeyStore.IsApproved(ValueName); }
             catch { return false; }
         }
 
@@ -52,6 +58,7 @@ namespace ParaDesk.Core
         ///
         /// 刻意由**非提权**的主进程调用：这些都写在 HKCU，
         /// 而 UAC 提权后的子进程有可能挂在另一个管理员账户下，那样就写错人了。
+        ///
         /// </summary>
         public static bool ApplyAll(bool enable)
         {
@@ -59,51 +66,108 @@ namespace ParaDesk.Core
 
             try
             {
-                using (var k = Registry.CurrentUser.CreateSubKey(ResumeKey))
-                {
-                    if (k != null)
-                    {
-                        if (enable)
-                        {
-                            k.SetValue("IsResumeAllowed", 0, RegistryValueKind.DWord);
-                            k.SetValue("IsOneDriveResumeAllowed", 0, RegistryValueKind.DWord);
-                            Log.Info("已关闭跨设备恢复的用户开关");
-                        }
-                        else
-                        {
-                            // 恢复时把我们写的值删掉，而不是写回 1——
-                            // 本来是什么状态由 Windows 自己决定，我们不替它做主
-                            if (k.GetValue("IsResumeAllowed") != null) k.DeleteValue("IsResumeAllowed", false);
-                            if (k.GetValue("IsOneDriveResumeAllowed") != null) k.DeleteValue("IsOneDriveResumeAllowed", false);
-                        }
-                    }
-                }
+                if (enable) DisableResume();
+                else RestoreResume();
             }
             catch (Exception ex) { Log.Warn("写入跨设备用户开关失败: " + ex.Message); }
 
             return ok;
         }
 
-        /// <summary>注册／注销子会话守护。不需要提权。</summary>
+        private const string ProductKey = @"Software\" + AppInfo.ProductName;
+        private const string ResumeBackupKey = ProductKey + @"\CrossDeviceResumeBackup";
+
+        private static readonly string[] ResumeValues = { "IsResumeAllowed", "IsOneDriveResumeAllowed" };
+
+        private const string BackupAbsent = "absent";
+
+        private const string BackupKeep = "keep";
+
+        private static void DisableResume()
+        {
+            using (var k = Registry.CurrentUser.CreateSubKey(ResumeKey))
+            {
+                if (k == null) return;
+                BackupResumeSwitches(k);
+                foreach (string name in ResumeValues)
+                    k.SetValue(name, 0, RegistryValueKind.DWord);
+                Log.Info("已关闭跨设备恢复的用户开关");
+            }
+        }
+
+        private static void BackupResumeSwitches(RegistryKey resume)
+        {
+            using (var b = Registry.CurrentUser.CreateSubKey(ResumeBackupKey))
+            {
+                if (b == null) throw new InvalidOperationException("无法创建 HKCU\\" + ResumeBackupKey);
+                foreach (string name in ResumeValues)
+                {
+                    if (b.GetValue(name) != null) continue;
+                    object v = resume.GetValue(name);
+                    if (v == null) b.SetValue(name, BackupAbsent, RegistryValueKind.String);
+                    else if (v is int && resume.GetValueKind(name) == RegistryValueKind.DWord)
+                        b.SetValue(name, (int)v, RegistryValueKind.DWord);
+                    else b.SetValue(name, BackupKeep, RegistryValueKind.String);
+                }
+            }
+        }
+
+        private static void RestoreResume()
+        {
+            using (var b = Registry.CurrentUser.OpenSubKey(ResumeBackupKey, false))
+            {
+                if (b == null)
+                {
+                    Log.Info("没有「跨设备恢复」开关的原值记录（不是本程序改的，或是旧版改的），撤销时不动它");
+                    return;
+                }
+
+                using (var k = Registry.CurrentUser.OpenSubKey(ResumeKey, true))
+                {
+                    foreach (string name in ResumeValues)
+                    {
+                        object orig = b.GetValue(name);
+                        if (k == null || orig == null) continue;
+
+                        object cur = k.GetValue(name);
+                        if (!(cur is int) || (int)cur != 0)
+                        {
+                            Log.Info("跨设备恢复开关 " + name + " 在配置后被改过，撤销时保持现状");
+                            continue;
+                        }
+
+                        if (orig is int) k.SetValue(name, (int)orig, RegistryValueKind.DWord);
+                        else if (string.Equals(orig as string, BackupAbsent, StringComparison.Ordinal)) k.DeleteValue(name, false);
+                    }
+                }
+            }
+
+            Registry.CurrentUser.DeleteSubKey(ResumeBackupKey, false);
+            bool empty;
+            using (var p = Registry.CurrentUser.OpenSubKey(ProductKey, false))
+                empty = p != null && p.SubKeyCount == 0 && p.ValueCount == 0;
+            if (empty) Registry.CurrentUser.DeleteSubKey(ProductKey, false);
+            Log.Info("已按记录还原跨设备恢复的用户开关");
+        }
+
         public static bool Apply(bool enable)
         {
             try
             {
-                using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
+                if (enable)
                 {
-                    if (k == null) return false;
-                    if (enable)
-                    {
-                        k.SetValue(ValueName,
-                            "\"" + AppInfo.ExecutablePath + "\" --childagent",
-                            RegistryValueKind.String);
-                        Log.Info("已启用子会话守护（关闭 Windows 无效错误框）");
-                    }
-                    else
-                    {
-                        if (k.GetValue(ValueName) != null) k.DeleteValue(ValueName, false);
-                        Log.Info("已关闭子会话守护");
-                    }
+                    string exe = AppInfo.ExecutablePath;
+                    RunKeyStore.Set(ValueName, RunKeyStore.BuildCommand(exe, AgentArgs));
+                    if (RunKeyStore.ClearApprovalBlock(ValueName))
+                        Log.Info("子会话守护曾在系统启动项里被禁用（任务管理器或「设置 → 应用 → 启动」），已清除禁用标记——启动命令、保持唤醒和错误框拦截都靠它");
+                    Log.Info("已启用子会话守护（关闭 Windows 无效错误框、执行启动命令、保持唤醒）");
+                    if (RunKeyStore.IsUnderTempDir(exe))
+                        Log.Warn("子会话守护指向临时目录里的程序（多半是从压缩包直接运行）: " + exe + "，临时文件被清掉后守护会失效，下次从固定位置运行时会自动改写");
+                }
+                else
+                {
+                    RunKeyStore.Remove(ValueName);
+                    Log.Info("已关闭子会话守护");
                 }
                 return true;
             }

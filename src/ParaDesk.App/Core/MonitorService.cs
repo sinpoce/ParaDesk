@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -13,7 +14,7 @@ namespace ParaDesk.Core
         public Rectangle Bounds;       // 虚拟桌面坐标（副屏可能为负）
         public Rectangle WorkingArea;
         public bool IsPrimary;
-        public int Index;              // 1 起，仅用于显示
+        public int Index;
 
         public string ShortName
         {
@@ -30,31 +31,30 @@ namespace ParaDesk.Core
         }
     }
 
-    /// <summary>
-    /// 显示器枚举与热插拔通知。
-    /// 两个坑：(1) Screen 对象的 Bounds 是构造时快照，永不刷新，所以绝不缓存实例；
-    /// (2) DisplaySettingsChanged 在 SystemEvents 的工作线程上触发，且一次布局变更
-    /// 会连续触发多次，必须去抖并切回 UI 线程。
-    /// </summary>
     internal class MonitorService : IDisposable
     {
-        private bool _hooked;
-        private readonly System.Windows.Forms.Timer _debounce;
+        private const int DebounceMs = 800;
 
-        /// <summary>显示器布局发生变化（插拔/改分辨率/改缩放）。已在 UI 线程去抖后触发。</summary>
+        private bool _hooked;
+        private bool _disposed;
+        private readonly System.Windows.Forms.Timer _debounce;
+        private readonly SynchronizationContext _ui;
+
         public event EventHandler LayoutChanged;
 
         public MonitorService()
         {
-            _debounce = new System.Windows.Forms.Timer();
-            _debounce.Interval = 800;
-            _debounce.Tick += delegate
+            _ui = SynchronizationContext.Current;
+            if (_ui == null || _ui.GetType() == typeof(SynchronizationContext))
             {
-                _debounce.Stop();
-                Log.Info("显示器布局变化（去抖后）");
-                var h = LayoutChanged;
-                if (h != null) h(this, EventArgs.Empty);
-            };
+                _ui = new WindowsFormsSynchronizationContext();
+            }
+            if (Thread.CurrentThread.GetApartmentState() != ApartmentState.STA)
+                Log.Warn("MonitorService 不是在 STA 线程上构造的，显示器变化通知可能无法送达");
+
+            _debounce = new System.Windows.Forms.Timer();
+            _debounce.Interval = DebounceMs;
+            _debounce.Tick += OnDebounceTick;
 
             SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
             _hooked = true;
@@ -62,13 +62,35 @@ namespace ParaDesk.Core
 
         private void OnDisplaySettingsChanged(object sender, EventArgs e)
         {
-            // 在工作线程上被调用；Timer 属于 UI 线程，重启它即可把后续处理搬回 UI 线程
+            DisplayCapabilities.Invalidate();
+            try
+            {
+                _ui.Post(delegate { RestartDebounce(); }, null);
+            }
+            catch (Exception ex) { Log.Error("转发显示器变化通知失败", ex); }
+        }
+
+        private void RestartDebounce()
+        {
+            if (_disposed) return;
             try
             {
                 _debounce.Stop();
                 _debounce.Start();
             }
             catch (Exception ex) { Log.Error("处理显示器变化失败", ex); }
+        }
+
+        private void OnDebounceTick(object sender, EventArgs e)
+        {
+            _debounce.Stop();
+            if (_disposed) return;
+            Log.Info("显示器布局变化（去抖后）");
+
+            DisplayCapabilities.Invalidate();
+
+            var h = LayoutChanged;
+            if (h != null) h(this, EventArgs.Empty);
         }
 
         /// <summary>每次调用都重新枚举，不缓存。</summary>
@@ -132,6 +154,8 @@ namespace ParaDesk.Core
 
         public void Dispose()
         {
+            if (_disposed) return;
+            _disposed = true;
             if (_hooked)
             {
                 SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;

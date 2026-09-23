@@ -83,7 +83,6 @@ namespace ParaDesk.Rdp
         void SendClipboardToClient();
     }
 
-    /// <summary>连接状态。对应 IMsTscAx.Connected 的 0/1/2。</summary>
     internal enum RdpConnectionState
     {
         Disconnected = 0,
@@ -92,9 +91,29 @@ namespace ParaDesk.Rdp
         Unknown = -1,
     }
 
+    internal enum RdpKeyboardHookMode
+    {
+        Local = 0,
+        Remote = 1,
+        FullScreenOnly = 2,
+    }
+
+    [Flags]
+    internal enum RdpPerformanceFlags
+    {
+        None = 0,
+        EnableEnhancedGraphics = 0x00000010,
+        EnableFontSmoothing = 0x00000080,
+        EnableDesktopComposition = 0x00000100,
+    }
+
     /// <summary>断开原因的人话化。</summary>
     internal static class RdpDisconnectReason
     {
+        private const int StatusLogonFailure = unchecked((int)0xC000006D);
+        private const int StatusAccountRestriction = unchecked((int)0xC000006E);
+        private const int StatusPasswordMustChange = unchecked((int)0xC0000224);
+
         /// <summary>把 discReason / extendedReason 翻译成用户能据以行动的说明。</summary>
         public static string Describe(int discReason, int extendedReason)
         {
@@ -125,6 +144,41 @@ namespace ParaDesk.Rdp
                     return L.T("凭据委派被组策略禁止，无法自动登录分身桌面。");
             }
             return null;
+        }
+
+        public static string DescribeLogonError(int lError)
+        {
+            switch (lError)
+            {
+                case -2:
+                case 3:
+                    return null;
+                case 0:
+                case StatusLogonFailure:
+                    return L.T("用户名或密码不正确。");
+                case 1:
+                    return L.T("账户密码已过期，请先在主桌面修改密码。");
+                case 2:
+                    return L.T("登录未完成，分身桌面停在了登录界面。");
+                case StatusAccountRestriction:
+                    return L.T("账户受限制（例如登录时段限制，或不允许空密码登录）。");
+                case StatusPasswordMustChange:
+                    return L.T("账户要求先修改密码才能登录。");
+            }
+            if (lError < 0 && lError >= -7) return L.T("登录被系统的会话仲裁打断。");
+            return L.T("登录失败。");
+        }
+
+        public static string FormatLogonFailure(int lError)
+        {
+            string desc = DescribeLogonError(lError) ?? L.T("登录失败。");
+            string code = lError < -0xFFFF ? "0x" + lError.ToString("X8") : lError.ToString();
+            return string.Format(L.T("登录分身桌面失败（错误码 {0}）：{1}"), code, desc);
+        }
+
+        public static string ConnectTimeout
+        {
+            get { return L.T("连接超时：可能停在了登录或证书确认，查看日志了解详情。"); }
         }
 
         /// <summary>

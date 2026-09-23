@@ -2,24 +2,39 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Windows;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
 using ParaDesk.Core;
 
 namespace ParaDesk.Shell
 {
-    /// <summary>
-    /// 按真实相对位置与比例绘制显示器，点击即指派分身桌面的位置。
-    /// 自绘（OnRender）而非控件拼装：布局是任意坐标的矩形集合，
-    /// 用面板容器反而更绕，而且这样能原生适配任意 DPI。
-    /// </summary>
     internal class MonitorLayoutView : FrameworkElement
     {
-        private List<MonitorInfo> _monitors = new List<MonitorInfo>();
+        private sealed class Tile
+        {
+            public string Device;
+            public System.Drawing.Rectangle Bounds;
+            public string Number;
+            public string CustomName;
+            public string Caption;
+        }
+
+        private sealed class Palette
+        {
+            public Brush Fg, FgDim, Accent, CardBg, HoverFill, SelectedFill, ActiveDot;
+            public Pen Stroke, SelectedStroke;
+        }
+
+        private List<Tile> _tiles = new List<Tile>();
         private readonly Dictionary<string, Rect> _hit = new Dictionary<string, Rect>();
         private string _selected;
         private string _hover;
         private string _active;
+
+        private Palette _palette;
+        private FontFamily _fontFamily;
+        private Typeface _typeNormal, _typeBold;
 
         public event EventHandler SelectionChanged;
 
@@ -27,6 +42,15 @@ namespace ParaDesk.Shell
         {
             Focusable = false;
             SnapsToDevicePixels = true;
+
+            Loaded += delegate
+            {
+                WpfHost.ThemeChanged -= OnThemeChanged;
+                WpfHost.ThemeChanged += OnThemeChanged;
+                _palette = null;
+                InvalidateVisual();
+            };
+            Unloaded += delegate { WpfHost.ThemeChanged -= OnThemeChanged; };
         }
 
         public string SelectedDevice
@@ -44,8 +68,40 @@ namespace ParaDesk.Shell
 
         public void SetMonitors(List<MonitorInfo> monitors)
         {
-            _monitors = monitors ?? new List<MonitorInfo>();
+            var tiles = new List<Tile>();
+            if (monitors != null)
+            {
+                foreach (var m in monitors)
+                {
+                    if (m == null) continue;
+                    tiles.Add(new Tile
+                    {
+                        Device = m.DeviceName,
+                        Bounds = m.Bounds,
+                        Number = IdentifyOverlay.DisplayNumber(m).ToString(CultureInfo.InvariantCulture),
+                        CustomName = MonitorNaming.CustomName(m.DeviceName),
+                        Caption = m.Bounds.Width + "×" + m.Bounds.Height + (m.IsPrimary ? "  " + L.T("主屏") : ""),
+                    });
+                }
+            }
+            _tiles = tiles;
             InvalidateVisual();
+        }
+
+        private void OnThemeChanged(object sender, EventArgs e)
+        {
+            _palette = null;
+            InvalidateVisual();
+        }
+
+        protected override void OnPropertyChanged(DependencyPropertyChangedEventArgs e)
+        {
+            base.OnPropertyChanged(e);
+            if (e.Property == TextElement.FontFamilyProperty)
+            {
+                _fontFamily = null;
+                InvalidateVisual();
+            }
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -84,15 +140,74 @@ namespace ParaDesk.Shell
             return null;
         }
 
+        private Palette GetPalette()
+        {
+            if (_palette != null) return _palette;
+
+            var p = new Palette();
+            p.Fg = Res("TextFillColorPrimaryBrush", Color.FromRgb(0x20, 0x20, 0x20));
+            p.FgDim = Res("TextFillColorSecondaryBrush", Color.FromRgb(0x70, 0x70, 0x70));
+            p.Accent = Res("AccentFillColorDefaultBrush", Color.FromRgb(0x00, 0x78, 0xD4));
+            p.CardBg = Res("CardBackgroundFillColorDefaultBrush", Color.FromRgb(0xFA, 0xFA, 0xFA));
+            p.HoverFill = Res("SubtleFillColorSecondaryBrush", Color.FromRgb(0xF0, 0xF0, 0xF0));
+            Brush stroke = Res("CardStrokeColorDefaultBrush", Color.FromRgb(0xC8, 0xC8, 0xC8));
+
+            var accentSolid = p.Accent as SolidColorBrush;
+            Color ac = accentSolid != null ? accentSolid.Color : Color.FromRgb(0x00, 0x78, 0xD4);
+            p.SelectedFill = Frozen(new SolidColorBrush(Color.FromArgb(38, ac.R, ac.G, ac.B)));
+            p.ActiveDot = Frozen(new SolidColorBrush(Color.FromRgb(0x10, 0x89, 0x3E)));
+
+            p.Stroke = FrozenPen(stroke, 1.0);
+            p.SelectedStroke = FrozenPen(p.Accent, 2.0);
+
+            _palette = p;
+            return p;
+        }
+
         private static Brush Res(string key, Color fallback)
         {
+            Brush b = null;
             try
             {
-                var b = Application.Current != null ? Application.Current.TryFindResource(key) as Brush : null;
-                if (b != null) return b;
+                b = Application.Current != null ? Application.Current.TryFindResource(key) as Brush : null;
             }
-            catch { }
-            return new SolidColorBrush(fallback);
+            catch (Exception ex) { Log.Debug("查找画刷资源 " + key + " 失败: " + ex.Message); }
+
+            if (b == null) return Frozen(new SolidColorBrush(fallback));
+            if (b.IsFrozen) return b;
+
+            try
+            {
+                var copy = b.CloneCurrentValue();
+                if (copy.CanFreeze) { copy.Freeze(); return copy; }
+            }
+            catch (Exception ex) { Log.Debug("复制画刷资源 " + key + " 失败: " + ex.Message); }
+
+            var solid = b as SolidColorBrush;
+            if (solid != null) return Frozen(new SolidColorBrush(solid.Color) { Opacity = solid.Opacity });
+            return Frozen(new SolidColorBrush(fallback));
+        }
+
+        private static Brush Frozen(Brush b)
+        {
+            if (b.CanFreeze) b.Freeze();
+            return b;
+        }
+
+        private static Pen FrozenPen(Brush brush, double thickness)
+        {
+            var pen = new Pen(brush, thickness);
+            if (pen.CanFreeze) pen.Freeze();
+            return pen;
+        }
+
+        private void EnsureTypefaces()
+        {
+            var family = TextElement.GetFontFamily(this);
+            if (_fontFamily != null && ReferenceEquals(family, _fontFamily)) return;
+            _fontFamily = family ?? SystemFonts.MessageFontFamily;
+            _typeNormal = new Typeface(_fontFamily, FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
+            _typeBold = new Typeface(_fontFamily, FontStyles.Normal, FontWeights.SemiBold, FontStretches.Normal);
         }
 
         protected override void OnRender(DrawingContext dc)
@@ -103,20 +218,17 @@ namespace ParaDesk.Shell
             double W = ActualWidth, H = ActualHeight;
             if (W <= 4 || H <= 4) return;
 
-            Brush fg = Res("TextFillColorPrimaryBrush", Color.FromRgb(0x20, 0x20, 0x20));
-            Brush fgDim = Res("TextFillColorSecondaryBrush", Color.FromRgb(0x70, 0x70, 0x70));
-            Brush accent = Res("AccentFillColorDefaultBrush", Color.FromRgb(0x00, 0x78, 0xD4));
-            Brush cardBg = Res("CardBackgroundFillColorDefaultBrush", Color.FromRgb(0xFA, 0xFA, 0xFA));
-            Brush stroke = Res("CardStrokeColorDefaultBrush", Color.FromRgb(0xC8, 0xC8, 0xC8));
+            var pal = GetPalette();
+            EnsureTypefaces();
 
-            if (_monitors.Count == 0)
+            if (_tiles.Count == 0)
             {
-                DrawText(dc, L.T("未检测到显示器"), 13, fgDim, new Point(W / 2, H / 2), true);
+                DrawText(dc, L.T("未检测到显示器"), 13, pal.FgDim, new Point(W / 2, H / 2), true);
                 return;
             }
 
             double minX = double.MaxValue, minY = double.MaxValue, maxX = double.MinValue, maxY = double.MinValue;
-            foreach (var m in _monitors)
+            foreach (var m in _tiles)
             {
                 minX = Math.Min(minX, m.Bounds.Left);
                 minY = Math.Min(minY, m.Bounds.Top);
@@ -131,60 +243,51 @@ namespace ParaDesk.Shell
             double offX = pad + (availW - vw * scale) / 2.0;
             double offY = pad + (availH - vh * scale) / 2.0;
 
-            foreach (var m in _monitors)
+            foreach (var m in _tiles)
             {
                 var r = new Rect(
                     offX + (m.Bounds.Left - minX) * scale,
                     offY + (m.Bounds.Top - minY) * scale,
                     Math.Max(40, m.Bounds.Width * scale - 6),
                     Math.Max(30, m.Bounds.Height * scale - 6));
-                _hit[m.DeviceName] = r;
+                _hit[m.Device] = r;
 
-                bool sel = m.DeviceName == _selected;
-                bool hov = m.DeviceName == _hover;
-                bool act = m.DeviceName == _active;
+                bool sel = m.Device == _selected;
+                bool hov = m.Device == _hover;
+                bool act = m.Device == _active;
 
-                Brush fill = cardBg;
-                if (sel) fill = new SolidColorBrush(Color.FromArgb(38,
-                    ((SolidColorBrush)accent).Color.R, ((SolidColorBrush)accent).Color.G,
-                    ((SolidColorBrush)accent).Color.B));
-                else if (hov) fill = Res("SubtleFillColorSecondaryBrush", Color.FromRgb(0xF0, 0xF0, 0xF0));
+                Brush fill = sel ? pal.SelectedFill : (hov ? pal.HoverFill : pal.CardBg);
+                dc.DrawRoundedRectangle(fill, sel ? pal.SelectedStroke : pal.Stroke, r, 6, 6);
 
-                var pen = new Pen(sel ? accent : stroke, sel ? 2.0 : 1.0);
-                dc.DrawRoundedRectangle(fill, pen, r, 6, 6);
-
-                // 屏幕编号：一眼对应现实里的位置
-                DrawText(dc, m.Index.ToString(CultureInfo.InvariantCulture),
-                    Math.Max(16, Math.Min(34, r.Height / 3)), sel ? accent : fg,
+                DrawText(dc, m.Number,
+                    Math.Max(16, Math.Min(34, r.Height / 3)), sel ? pal.Accent : pal.Fg,
                     new Point(r.Left + r.Width / 2, r.Top + r.Height / 2 - 8), true);
 
                 // 起过名的屏用名字顶掉编号下方那行，没起过还是显示分辨率
-                string custom = MonitorNaming.CustomName(m.DeviceName);
-                if (!string.IsNullOrEmpty(custom))
+                if (!string.IsNullOrEmpty(m.CustomName))
                 {
-                    DrawText(dc, custom, 12, sel ? accent : fg,
+                    DrawText(dc, m.CustomName, 12, sel ? pal.Accent : pal.Fg,
                         new Point(r.Left + r.Width / 2, r.Bottom - 30), true);
                 }
 
-                string cap = m.Bounds.Width + "×" + m.Bounds.Height + (m.IsPrimary ? "  " + L.T("主屏") : "");
-                DrawText(dc, cap, 11, fgDim,
+                DrawText(dc, m.Caption, 11, pal.FgDim,
                     new Point(r.Left + r.Width / 2, r.Bottom - 16), true);
 
                 if (act)
                 {
                     var dot = new Point(r.Right - 14, r.Top + 14);
-                    dc.DrawEllipse(new SolidColorBrush(Color.FromRgb(0x10, 0x89, 0x3E)), null, dot, 5, 5);
+                    dc.DrawEllipse(pal.ActiveDot, null, dot, 5, 5);
                 }
             }
 
-            DrawText(dc, L.T("点击选择分身桌面显示的位置"), 11, fgDim, new Point(W / 2, H - 14), true);
+            DrawText(dc, L.T("点击选择分身桌面显示的位置"), 11, pal.FgDim, new Point(W / 2, H - 14), true);
         }
 
         private void DrawText(DrawingContext dc, string text, double size, Brush brush, Point at, bool center)
         {
+            if (string.IsNullOrEmpty(text)) return;
             var ft = new FormattedText(text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
-                new Typeface(new FontFamily("Microsoft YaHei UI, Segoe UI"), FontStyles.Normal,
-                    size >= 16 ? FontWeights.SemiBold : FontWeights.Normal, FontStretches.Normal),
+                size >= 16 ? _typeBold : _typeNormal,
                 size, brush, VisualTreeHelper.GetDpi(this).PixelsPerDip);
 
             var p = center ? new Point(at.X - ft.Width / 2, at.Y - ft.Height / 2) : at;

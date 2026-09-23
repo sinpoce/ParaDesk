@@ -22,12 +22,22 @@ namespace ParaDesk.Diagnostics
     /// </summary>
     internal static class DisplaySpike
     {
+        private const int LoginTimeoutSeconds = 90;
+
+        private const int SettleSeconds = 2;
+
+        private static void Say(string msg)
+        {
+            Console.WriteLine(msg);
+            Log.Info("[spike] " + msg);
+        }
+
         public static int Run()
         {
             var env = SystemStatus.Check();
             if (!env.ReadyToStart)
             {
-                Console.WriteLine("环境未就绪，无法验证: " + (env.NextAction ?? ""));
+                Say("环境未就绪，无法验证: " + (env.NextAction ?? ""));
                 return 2;
             }
 
@@ -40,8 +50,9 @@ namespace ParaDesk.Diagnostics
             string report = form.Report;
             Console.Write(report);
             Log.Info(report.TrimEnd());
-            try { File.WriteAllText(Path.Combine(Log.Dir, "spike-display.log"), report, Encoding.UTF8); }
-            catch { }
+            string path = Path.Combine(Log.Dir, "spike-display.log");
+            try { File.WriteAllText(path, report, Encoding.UTF8); }
+            catch (Exception ex) { Say("写入 " + path + " 失败: " + ex.Message); }
             return form.Success ? 0 : 1;
         }
 
@@ -85,7 +96,7 @@ namespace ParaDesk.Diagnostics
                 {
                     _timer.Stop();
                     try { if (_ocx != null) _ocx.Disconnect(); }
-                    catch { }
+                    catch (Exception ex) { Log.Debug("spike: 关闭时断开连接失败: " + Brief(ex)); }
                 };
             }
 
@@ -124,13 +135,18 @@ namespace ParaDesk.Diagnostics
                     _ocx.ColorDepth = 32;
 
                     dynamic adv = null;
-                    try { adv = _ocx.AdvancedSettings9; } catch { }
+                    try { adv = _ocx.AdvancedSettings9; }
+                    catch (Exception ex) { Note("取 AdvancedSettings9 失败，以下高级设置全部未生效: " + Brief(ex)); }
                     if (adv != null)
                     {
-                        try { adv.EnableCredSspSupport = true; } catch { }
-                        try { adv.AuthenticationLevel = 0; } catch { }
-                        try { adv.DisplayConnectionBar = false; } catch { }
-                        try { adv.SmartSizing = true; } catch { }
+                        try { adv.EnableCredSspSupport = true; }
+                        catch (Exception ex) { Note("EnableCredSspSupport=true 未生效: " + Brief(ex)); }
+                        try { adv.AuthenticationLevel = 0; }
+                        catch (Exception ex) { Note("AuthenticationLevel=0 未生效: " + Brief(ex)); }
+                        try { adv.DisplayConnectionBar = false; }
+                        catch (Exception ex) { Note("DisplayConnectionBar=false 未生效: " + Brief(ex)); }
+                        try { adv.SmartSizing = true; }
+                        catch (Exception ex) { Note("SmartSizing=true 未生效: " + Brief(ex)); }
                     }
 
                     var ext = (IMsRdpExtendedSettings)_host.Ocx;
@@ -154,12 +170,15 @@ namespace ParaDesk.Diagnostics
 
                 if (!_loggedIn)
                 {
-                    if (_ticks > 90) { Step("等待登录超时（90 秒）", false); Finish(); }
+                    if (_ticks > LoginTimeoutSeconds)
+                    {
+                        Step("等待登录超时（" + LoginTimeoutSeconds + " 秒）", false);
+                        Finish();
+                    }
                     return;
                 }
 
-                // 登录后再等 2 秒让会话稳定，否则调用会以 E_FAIL 失败
-                if (_phase == 1 && _ticks < 2) return;
+                if (_phase == 1 && _ticks < SettleSeconds) return;
 
                 switch (_phase)
                 {
@@ -237,6 +256,13 @@ namespace ParaDesk.Diagnostics
                 Log.Info("spike: " + line);
             }
 
+            private void Note(string text)
+            {
+                string line = "[WARN] " + text;
+                _sb.AppendLine(line);
+                Log.Warn("spike: " + line);
+            }
+
             private void Finish()
             {
                 if (_closing) return;
@@ -268,7 +294,7 @@ namespace ParaDesk.Diagnostics
                 }
 
                 try { if (!IsDisposed) Close(); }
-                catch { }
+                catch (Exception ex) { Log.Debug("spike: 关闭验证窗口失败: " + Brief(ex)); }
             }
 
             private static string Brief(Exception ex)

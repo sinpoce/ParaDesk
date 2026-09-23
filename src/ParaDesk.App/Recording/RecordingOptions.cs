@@ -26,6 +26,10 @@ namespace ParaDesk.Recording
         [DataMember(Name = "captureCursor")] public bool CaptureCursor { get; set; }
         [DataMember(Name = "audio")] public AudioSource Audio { get; set; }
 
+        [DataMember(Name = "autoRecordWithDesktop")] public bool AutoRecordWithDesktop { get; set; }
+
+        [DataMember(Name = "segmentMinutes")] public int SegmentMinutes { get; set; }
+
         public int BitrateBps { get { return Math.Max(1, BitrateMbps) * 1000000; } }
 
         public static string DefaultFolder
@@ -51,12 +55,21 @@ namespace ParaDesk.Recording
             };
         }
 
+        public const int MaxSegmentMinutes = 720;
+
         public void Normalize()
         {
-            if (FrameRate < 5 || FrameRate > 240) FrameRate = 30;
+            if (FrameRate < 1 || FrameRate > 240) FrameRate = 30;
             if (BitrateMbps < 1 || BitrateMbps > 200) BitrateMbps = 12;
             if (!Enum.IsDefined(typeof(AudioSource), Audio)) Audio = AudioSource.System;
             if (string.IsNullOrEmpty(OutputFolder)) OutputFolder = DefaultFolder;
+            if (SegmentMinutes < 0) SegmentMinutes = 0;
+            if (SegmentMinutes > MaxSegmentMinutes) SegmentMinutes = MaxSegmentMinutes;
+        }
+
+        public RecordingOptions Clone()
+        {
+            return (RecordingOptions)MemberwiseClone();
         }
     }
 

@@ -72,6 +72,8 @@ namespace ParaDesk.Ui
         public static string Pick(IntPtr owner, string title, string initialPath)
         {
             IFileDialog dialog = null;
+            IShellItem start = null;
+            IShellItem result = null;
             try
             {
                 dialog = (IFileDialog)new FileOpenDialogRcw();
@@ -83,7 +85,6 @@ namespace ParaDesk.Ui
                     try
                     {
                         Guid iid = typeof(IShellItem).GUID;
-                        IShellItem start;
                         SHCreateItemFromParsingName(initialPath, IntPtr.Zero, ref iid, out start);
                         if (start != null) dialog.SetFolder(start);
                     }
@@ -94,7 +95,6 @@ namespace ParaDesk.Ui
                 if (hr == ERROR_CANCELLED) return null;
                 if (hr != 0) { Log.Warn("文件夹选择对话框返回 0x" + hr.ToString("X8")); return null; }
 
-                IShellItem result;
                 dialog.GetResult(out result);
                 if (result == null) return null;
 
@@ -109,8 +109,17 @@ namespace ParaDesk.Ui
             }
             finally
             {
-                if (dialog != null) Marshal.ReleaseComObject(dialog);
+                ReleaseRcw(result);
+                ReleaseRcw(start);
+                ReleaseRcw(dialog);
             }
+        }
+
+        private static void ReleaseRcw(object o)
+        {
+            if (o == null) return;
+            try { Marshal.ReleaseComObject(o); }
+            catch (Exception ex) { Log.Debug("释放文件夹对话框 COM 对象失败: " + ex.Message); }
         }
     }
 }

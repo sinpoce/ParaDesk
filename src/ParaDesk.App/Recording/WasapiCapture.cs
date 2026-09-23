@@ -95,6 +95,17 @@ namespace ParaDesk.Recording
         private const uint AUDCLNT_BUFFERFLAGS_SILENT = 0x2;
         private const ushort WAVE_FORMAT_PCM = 1;
 
+        private const int E_ACCESSDENIED = unchecked((int)0x80070005);
+        private const uint AUDCLNT_E_NOT_INITIALIZED = 0x88890001;
+        private const uint AUDCLNT_E_DEVICE_INVALIDATED = 0x88890004;
+        private const uint AUDCLNT_E_DEVICE_IN_USE = 0x8889000A;
+
+        private const long BufferDuration100ns = 200 * 10000;
+
+        private const int PollIntervalMs = 5;
+
+        private const int StopJoinTimeoutMs = 500;
+
         // ---------------- 状态 ----------------
 
         private IAudioClient _client;
@@ -102,6 +113,10 @@ namespace ParaDesk.Recording
         private Thread _thread;
         private volatile bool _running;
         private readonly bool _loopback;
+
+        private readonly object _life = new object();
+        private bool _threadAlive;
+        private bool _disposeRequested;
 
         /// <summary>统一输出格式：48kHz / 16bit / 立体声。</summary>
         public const int SampleRate = 48000;
@@ -118,10 +133,11 @@ namespace ParaDesk.Recording
         public string Start()
         {
             IntPtr formatPtr = IntPtr.Zero;
+            IMMDeviceEnumerator enumerator = null;
+            IMMDevice device = null;
             try
             {
-                var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorRcw();
-                IMMDevice device;
+                enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorRcw();
                 int hr = enumerator.GetDefaultAudioEndpoint(
                     _loopback ? eRender : eCapture, eConsole, out device);
                 if (hr != 0 || device == null)
@@ -139,12 +155,11 @@ namespace ParaDesk.Recording
                 int flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
                 if (_loopback) flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
 
-                // 缓冲 200ms，足以扛住供样端偶发的抖动
-                hr = _client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2000000, 0, formatPtr, IntPtr.Zero);
+                hr = _client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, BufferDuration100ns, 0, formatPtr, IntPtr.Zero);
                 if (hr != 0)
                 {
                     Log.Warn((_loopback ? "环回" : "麦克风") + "初始化失败 0x" + hr.ToString("X8"));
-                    return hr == unchecked((int)0x80070005)
+                    return hr == E_ACCESSDENIED
                         ? L.T("系统拒绝访问麦克风，请在隐私设置中允许桌面应用使用麦克风。")
                         : string.Format(L.T("音频设备不支持所需格式（0x{0}）。"), hr.ToString("X8"));
                 }
@@ -163,10 +178,18 @@ namespace ParaDesk.Recording
                 }
 
                 _running = true;
-                _thread = new Thread(CaptureLoop);
-                _thread.IsBackground = true;
-                _thread.Name = _loopback ? "ParaDesk-Loopback" : "ParaDesk-Mic";
-                _thread.Start();
+                var thread = new Thread(CaptureLoop);
+                thread.IsBackground = true;
+                thread.Name = _loopback ? "ParaDesk-Loopback" : "ParaDesk-Mic";
+                lock (_life) _threadAlive = true;
+                try { thread.Start(); }
+                catch
+                {
+                    lock (_life) _threadAlive = false;
+                    _running = false;
+                    throw;
+                }
+                _thread = thread;
 
                 Log.Info((_loopback ? "系统声音" : "麦克风") + "采集已启动");
                 return null;
@@ -179,7 +202,16 @@ namespace ParaDesk.Recording
             finally
             {
                 if (formatPtr != IntPtr.Zero) Marshal.FreeHGlobal(formatPtr);
+                ReleaseRcw(device, "IMMDevice");
+                ReleaseRcw(enumerator, "MMDeviceEnumerator");
             }
+        }
+
+        private static void ReleaseRcw(object rcw, string what)
+        {
+            if (rcw == null) return;
+            try { Marshal.ReleaseComObject(rcw); }
+            catch (Exception ex) { Log.Debug("释放 " + what + " 失败: " + ex.Message); }
         }
 
         private static IntPtr BuildPcmFormat()
@@ -205,22 +237,23 @@ namespace ParaDesk.Recording
 
         private void CaptureLoop()
         {
+            var capture = _capture;
             try
             {
                 while (_running)
                 {
                     uint packet;
-                    int hr = _capture.GetNextPacketSize(out packet);
+                    int hr = capture.GetNextPacketSize(out packet);
                     if (hr != 0) { Fail("GetNextPacketSize", hr); return; }
 
-                    if (packet == 0) { Thread.Sleep(5); continue; }
+                    if (packet == 0) { Thread.Sleep(PollIntervalMs); continue; }
 
                     while (packet > 0 && _running)
                     {
                         IntPtr data;
                         uint frames, flags;
                         long devPos, qpc;
-                        hr = _capture.GetBuffer(out data, out frames, out flags, out devPos, out qpc);
+                        hr = capture.GetBuffer(out data, out frames, out flags, out devPos, out qpc);
                         if (hr != 0) { Fail("GetBuffer", hr); return; }
 
                         int bytes = (int)frames * BytesPerFrame;
@@ -235,17 +268,31 @@ namespace ParaDesk.Recording
                             if (h != null) h(buffer, bytes);
                         }
 
-                        _capture.ReleaseBuffer(frames);
-                        hr = _capture.GetNextPacketSize(out packet);
+                        capture.ReleaseBuffer(frames);
+                        hr = capture.GetNextPacketSize(out packet);
                         if (hr != 0) { Fail("GetNextPacketSize", hr); return; }
                     }
                 }
             }
             catch (Exception ex)
             {
-                Log.Error("音频采集循环异常", ex);
-                FailureReason = string.Format(L.T("{0}采集中断："), _loopback ? L.T("系统声音") : L.T("麦克风")) + ex.Message;
-                _running = false;
+                if (_running)
+                {
+                    Log.Error("音频采集循环异常", ex);
+                    FailureReason = string.Format(L.T("{0}采集中断："), _loopback ? L.T("系统声音") : L.T("麦克风")) + ex.Message;
+                    _running = false;
+                }
+                else Log.Debug("音频采集线程在停止过程中退出: " + ex.Message);
+            }
+            finally
+            {
+                bool release;
+                lock (_life)
+                {
+                    _threadAlive = false;
+                    release = _disposeRequested;
+                }
+                if (release) ReleaseCom();
             }
         }
 
@@ -256,14 +303,19 @@ namespace ParaDesk.Recording
         /// </summary>
         private void Fail(string where, int hr)
         {
+            if (!_running)
+            {
+                Log.Debug("音频采集在停止过程中返回 0x" + hr.ToString("X8") + "（" + where + "）");
+                return;
+            }
             _running = false;
             string what = _loopback ? L.T("系统声音") : L.T("麦克风");
             string reason;
             switch (unchecked((uint)hr))
             {
-                case 0x88890004: reason = string.Format(L.T("{0}设备已失效（可能被拔出或切换了默认设备）"), what); break;
-                case 0x88890001: reason = string.Format(L.T("{0}设备未初始化"), what); break;
-                case 0x88890008: reason = string.Format(L.T("{0}设备已被独占占用"), what); break;
+                case AUDCLNT_E_DEVICE_INVALIDATED: reason = string.Format(L.T("{0}设备已失效（可能被拔出或切换了默认设备）"), what); break;
+                case AUDCLNT_E_NOT_INITIALIZED: reason = string.Format(L.T("{0}设备未初始化"), what); break;
+                case AUDCLNT_E_DEVICE_IN_USE: reason = string.Format(L.T("{0}设备已被独占占用"), what); break;
                 default: reason = string.Format(L.T("{0}采集失败（{1} 0x{2}）"), what, where, hr.ToString("X8")); break;
             }
             FailureReason = reason;
@@ -273,18 +325,53 @@ namespace ParaDesk.Recording
         public void Stop()
         {
             _running = false;
-            try { if (_thread != null && _thread.IsAlive) _thread.Join(500); }
-            catch { }
+            var t = _thread;
+            if (t != null && t.IsAlive)
+            {
+                bool exited;
+                try { exited = t.Join(StopJoinTimeoutMs); }
+                catch (Exception ex)
+                {
+                    Log.Debug("等待音频采集线程退出失败: " + ex.Message);
+                    exited = false;
+                }
+                if (!exited)
+                    Log.Warn((_loopback ? "环回" : "麦克风") + "采集线程 " + StopJoinTimeoutMs +
+                             "ms 内未退出，COM 对象改由该线程退出时释放");
+            }
             _thread = null;
 
-            try { if (_client != null) _client.Stop(); } catch { }
+            var client = _client;
+            if (client != null)
+            {
+                try { client.Stop(); }
+                catch (Exception ex) { Log.Debug("停止音频流失败: " + ex.Message); }
+            }
         }
 
         public void Dispose()
         {
             Stop();
-            try { if (_capture != null) { Marshal.ReleaseComObject(_capture); _capture = null; } } catch { }
-            try { if (_client != null) { Marshal.ReleaseComObject(_client); _client = null; } } catch { }
+            bool deferred;
+            lock (_life)
+            {
+                _disposeRequested = true;
+                deferred = _threadAlive;
+            }
+            if (!deferred) ReleaseCom();
+        }
+
+        private void ReleaseCom()
+        {
+            IAudioCaptureClient capture;
+            IAudioClient client;
+            lock (_life)
+            {
+                capture = _capture; _capture = null;
+                client = _client; _client = null;
+            }
+            ReleaseRcw(capture, "IAudioCaptureClient");
+            ReleaseRcw(client, "IAudioClient");
         }
     }
 }

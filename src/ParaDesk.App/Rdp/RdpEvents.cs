@@ -22,7 +22,11 @@ namespace ParaDesk.Rdp
         [DispId(10)] void OnFatalError(int errorCode);
         [DispId(11)] void OnWarning(int warningCode);
         [DispId(12)] void OnRemoteDesktopSizeChange(int width, int height);
+        [DispId(13)] void OnIdleTimeoutNotification();
         [DispId(15)] bool OnConfirmClose();
+        [DispId(18)] void OnAuthenticationWarningDisplayed();
+        [DispId(19)] void OnAuthenticationWarningDismissed();
+        [DispId(22)] void OnLogonError(int lError);
         [DispId(33)] void OnAutoReconnected();
         [DispId(34)] void OnAutoReconnecting2(int disconnectReason, bool networkAvailable,
                                               int attemptCount, int maxAttemptCount);
@@ -38,6 +42,11 @@ namespace ParaDesk.Rdp
         public event EventHandler<RdpSizeChangedEventArgs> RemoteSizeChanged;
         public event EventHandler<RdpReconnectingEventArgs> Reconnecting;
         public event EventHandler Reconnected;
+
+        public event EventHandler<RdpLogonErrorEventArgs> LogonError;
+        public event EventHandler IdleTimeout;
+        public event EventHandler AuthenticationWarningDisplayed;
+        public event EventHandler AuthenticationWarningDismissed;
 
         /// <summary>返回 false 可阻止控件自行关闭；由宿主决定关闭时机。</summary>
         public Func<bool> ConfirmClose;
@@ -71,6 +80,30 @@ namespace ParaDesk.Rdp
             {
                 var h = RemoteSizeChanged;
                 if (h != null) h(this, new RdpSizeChangedEventArgs(width, height));
+            });
+        }
+
+        public void OnIdleTimeoutNotification()
+        {
+            Safe("OnIdleTimeoutNotification", delegate { Fire(IdleTimeout); });
+        }
+
+        public void OnAuthenticationWarningDisplayed()
+        {
+            Safe("OnAuthenticationWarningDisplayed", delegate { Fire(AuthenticationWarningDisplayed); });
+        }
+
+        public void OnAuthenticationWarningDismissed()
+        {
+            Safe("OnAuthenticationWarningDismissed", delegate { Fire(AuthenticationWarningDismissed); });
+        }
+
+        public void OnLogonError(int lError)
+        {
+            Safe("OnLogonError", delegate
+            {
+                var h = LogonError;
+                if (h != null) h(this, new RdpLogonErrorEventArgs(lError));
             });
         }
 
@@ -115,6 +148,12 @@ namespace ParaDesk.Rdp
     {
         public int DiscReason { get; private set; }
         public RdpDisconnectedEventArgs(int r) { DiscReason = r; }
+    }
+
+    internal class RdpLogonErrorEventArgs : EventArgs
+    {
+        public int Error { get; private set; }
+        public RdpLogonErrorEventArgs(int e) { Error = e; }
     }
 
     internal class RdpSizeChangedEventArgs : EventArgs

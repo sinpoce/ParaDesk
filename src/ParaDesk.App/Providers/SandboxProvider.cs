@@ -99,7 +99,7 @@ namespace ParaDesk.Providers
                     Arguments = "\"" + configPath + "\"",
                     UseShellExecute = true,
                 };
-                Process.Start(psi);
+                using (Process.Start(psi)) { }
 
                 Log.Info("已启动 Windows 沙盒，配置: " + configPath);
                 return null;
@@ -121,10 +121,19 @@ namespace ParaDesk.Providers
             try
             {
                 // 24H2 起客户端进程改名，两个名字都要查
-                return Process.GetProcessesByName("WindowsSandboxClient").Length > 0
-                    || Process.GetProcessesByName("WindowsSandboxRemoteSession").Length > 0;
+                return AnyProcessNamed("WindowsSandboxClient") || AnyProcessNamed("WindowsSandboxRemoteSession");
             }
             catch { return false; }
+        }
+
+        private static bool AnyProcessNamed(string name)
+        {
+            Process[] ps = Process.GetProcessesByName(name);
+            try { return ps.Length > 0; }
+            finally
+            {
+                foreach (var p in ps) p.Dispose();
+            }
         }
     }
 }

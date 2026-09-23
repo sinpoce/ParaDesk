@@ -4,11 +4,6 @@ using ParaDesk.Native;
 
 namespace ParaDesk.Core
 {
-    /// <summary>
-    /// 关机/注销拦截。子会话存在时 Windows 无法正常重启，必须先把它注销掉。
-    /// 用隐藏消息窗口接管 WM_QUERYENDSESSION，并调用 ShutdownBlockReasonCreate
-    /// 让用户在关机界面看到是谁在拖延，而不是无提示地卡住。
-    /// </summary>
     internal class ShutdownGuard : IDisposable
     {
         private sealed class MessageWindow : NativeWindow
@@ -76,7 +71,7 @@ namespace ParaDesk.Core
 
         private void RunCleanup()
         {
-            Log.Info("收到 WM_QUERYENDSESSION，执行关机前清理");
+            Log.Info("收到 WM_ENDSESSION，执行关机前清理");
             var h = Cleanup;
             if (h != null)
             {

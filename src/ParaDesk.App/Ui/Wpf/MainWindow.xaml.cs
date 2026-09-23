@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Media;
+using System.Windows.Threading;
 using ParaDesk.Core;
 using ParaDesk.Elevated;
 
@@ -16,10 +19,17 @@ namespace ParaDesk.Shell
     {
         private readonly ParaDesk.Ui.AppContext _app;
         private bool _loading;
+        private bool _closed;
 
         private static readonly int[] ScaleValues = { 0, 100, 125, 150, 175, 200, 250, 300 };
 
-        private System.Windows.Threading.DispatcherTimer _ticker;
+        private DispatcherTimer _ticker;
+
+        private const int RefreshCoalesceMs = 80;
+        private DispatcherTimer _refreshTimer;
+        private bool _refreshWhileHidden;
+        private bool _shownOnce;
+        private bool _lastAttached;
 
         public MainWindow(ParaDesk.Ui.AppContext app)
         {
@@ -30,14 +40,27 @@ namespace ParaDesk.Shell
 
             // 运行时长要跳秒，但整页刷新代价大（含注册表与显示器枚举），
             // 所以单开一个轻量 ticker 只更新指标数字。
-            _ticker = new System.Windows.Threading.DispatcherTimer
+            _ticker = new DispatcherTimer
             {
                 Interval = TimeSpan.FromSeconds(1),
             };
             _ticker.Tick += OnTick;
             _ticker.Start();
 
-            RefreshAll();
+            _refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(RefreshCoalesceMs) };
+            _refreshTimer.Tick += OnRefreshTimer;
+
+            _startupSaveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(StartupSaveDelayMs) };
+            _startupSaveTimer.Tick += delegate { SaveStartupCommand(); };
+            TbStartupCmd.LostFocus += OnStartupCmdLostFocus;
+            TbStartupDir.LostFocus += OnStartupCmdLostFocus;
+            TbStartupCmd.PlaceholderText = L.T("例如 wt -d C:\\repo 或 powershell -NoExit -Command claude");
+            TbStartupDir.PlaceholderText = L.T("工作目录（留空为用户主目录）");
+
+            InitHotkeySlots();
+            IsVisibleChanged += OnVisibleChangedRefresh;
+
+            RefreshAllNow();
         }
 
         private void OnTick(object sender, EventArgs e)
@@ -87,7 +110,8 @@ namespace ParaDesk.Shell
             if (PageScroller != null) PageScroller.ScrollToTop();
 
             if (tag == "Record") RefreshRecording(true);
-            if (tag == "Diag") BuildDiagnostics();
+            if (tag == "Hotkeys") WarnReservedHotkeys();
+            if (tag == "Diag" && !_diagLoaded) StartDiagnosticsCheck();
         }
 
         // ---------------- 刷新 ----------------
@@ -95,7 +119,37 @@ namespace ParaDesk.Shell
         public void RefreshAll()
         {
             if (!Dispatcher.CheckAccess()) { Dispatcher.BeginInvoke((Action)RefreshAll); return; }
+            if (_closed || _refreshTimer == null) return;
+            if (_refreshTimer.IsEnabled) return;
+            _refreshTimer.Start();
+        }
 
+        private void OnRefreshTimer(object sender, EventArgs e)
+        {
+            _refreshTimer.Stop();
+            if (_closed) return;
+            if (!IsVisible) { _refreshWhileHidden = true; return; }
+            RefreshAllNow();
+        }
+
+        private void OnVisibleChangedRefresh(object sender, DependencyPropertyChangedEventArgs e)
+        {
+            if (!IsVisible || _closed) return;
+            if (!_shownOnce)
+            {
+                _shownOnce = true;
+                if (!_refreshWhileHidden) return;
+            }
+            _refreshWhileHidden = false;
+            RefreshAllNow();
+        }
+
+        private void RefreshAllNow()
+        {
+            if (_refreshTimer != null) _refreshTimer.Stop();
+            if (_closed) return;
+
+            bool attachedChanged;
             _loading = true;
             try
             {
@@ -106,23 +160,27 @@ namespace ParaDesk.Shell
                 var p = s.GetActiveProfile();
                 bool attached = _app.DesktopAttached;
                 bool exists = SystemStatus.HasChildSession();
+                attachedChanged = attached != _lastAttached;
+                _lastAttached = attached;
 
                 UpdateStatusCard(env, p, attached, exists);
 
-                // 未配置不再让主按钮变灰——点它就会顺带把配置做掉。
-                // 只有这台机器压根跑不了（家庭版/缺组件/人在分身桌面里）才禁用。
-                BtnPrimary.Content = _app.SetupRunning
-                    ? L.T("正在配置…")
+                bool setupBusy = _app.SetupRunning;
+                string busyText = _app.UndoRunning ? L.T("正在撤销…") : L.T("正在配置…");
+                BtnPrimary.Content = setupBusy
+                    ? busyText
                     : attached ? L.T("收起桌面") : (exists ? L.T("重新接入") : L.T("启动桌面"));
-                BtnPrimary.IsEnabled = !_app.SetupRunning && (attached || !env.Blocked);
+                BtnPrimary.IsEnabled = !setupBusy && (attached || !env.Blocked);
                 BtnClose.IsEnabled = attached || exists;
+                BtnReconfigure.IsEnabled = !setupBusy;
+                BtnUndoSetup.IsEnabled = !setupBusy;
+                BtnUndoSetup.Content = _app.UndoRunning ? L.T("正在撤销…") : L.T("撤销配置…");
 
-                // 方案下拉框
                 CbProfile.Items.Clear();
                 int selProfile = 0;
                 for (int i = 0; i < s.Profiles.Count; i++)
                 {
-                    CbProfile.Items.Add(s.Profiles[i].Name);
+                    CbProfile.Items.Add(new ProfileItem(s.Profiles[i].Name));
                     if (string.Equals(s.Profiles[i].Name, p.Name, StringComparison.Ordinal)) selProfile = i;
                 }
                 CbProfile.SelectedIndex = selProfile;
@@ -143,8 +201,10 @@ namespace ParaDesk.Shell
 
                 PopulateMonitors(mons, p);
                 UpdateMonitorHint(mons, p, attached);
-                DisplayScopeHint.Text = string.Format(
+                string scope = string.Format(
                     L.T("以下设置随方案「{0}」保存，换方案会换成另一套。"), p.Name);
+                DisplayScopeHint.Text = scope;
+                InsideScopeHint.Text = scope;
 
                 CbWindowMode.SelectedIndex = (int)p.WindowMode;
                 PopulateResolutions(device, p);
@@ -152,6 +212,8 @@ namespace ParaDesk.Shell
                 PopulateFps(mons, device);
                 CbScale.SelectedIndex = ScaleIndex(p.ScalePercent);
                 SwViewOnly.IsChecked = p.ViewOnly;
+                SwViewOnlyQuick.IsChecked = p.ViewOnly;
+                ViewOnlyQuickHint.Text = DescribeViewOnlyHint(s);
                 SwTopMost.IsChecked = p.AlwaysOnTop;
                 CbClipboard.SelectedIndex = (int)p.Clipboard;
                 CbClipboard.IsEnabled = !attached;   // 剪贴板模式需重新连接才生效
@@ -160,16 +222,23 @@ namespace ParaDesk.Shell
                 ClipHint.Text = attached
                     ? L.T("修改后需重新启动分身桌面才生效")
                     : L.T("系统默认与主桌面共享；手动模式可避免两边互相覆盖");
+
+                RefreshInsideDesktop(p);
+
                 SwStartup.IsChecked = StartupRegistration.IsEnabled();
+                SwStartMinimized.IsChecked = s.StartMinimized;
+                SwAutoStartDesktop.IsChecked = s.AutoStartDesktop;
+                SwCheckUpdates.IsChecked = s.CheckUpdates;
                 SwTray.IsChecked = s.MinimizeToTray;
+                SwAutoReattach.IsChecked = s.AutoReattach;
+                SwConfirmClose.IsChecked = s.ConfirmBeforeClose;
+                SwLogoffOnShutdown.IsChecked = s.AutoLogoffOnShutdown;
                 CbLanguage.SelectedIndex = s.Language == "zh" ? 1 : (s.Language == "en" ? 2 : 0);
 
                 CbWindowMode.IsEnabled = !attached;
                 CbScale.IsEnabled = !attached;
 
-                HkToggle.SetBinding(FindHotkey(s, "toggleDesktop"), FindHotkeyKey(s, "toggleDesktop"));
-                HkViewOnly.SetBinding(FindHotkey(s, "toggleViewOnly"), FindHotkeyKey(s, "toggleViewOnly"));
-                HkRecord.SetBinding(FindHotkey(s, "toggleRecording"), FindHotkeyKey(s, "toggleRecording"));
+                foreach (var slot in _hotkeySlots) ShowSavedHotkey(s, slot);
 
                 CredHint.Text = CredentialStore.Exists
                     ? L.T("已保存凭据（DPAPI 加密，仅本机本账户可解）")
@@ -181,8 +250,8 @@ namespace ParaDesk.Shell
                 bool sbOk = Providers.SandboxProvider.IsAvailable(out sbReason);
                 _sandboxNeedsEnable = !sbOk && Providers.SandboxProvider.CanEnable();
 
-                BtnSandbox.IsEnabled = (sbOk || _sandboxNeedsEnable) && !_app.SetupRunning;
-                BtnSandbox.Content = _app.SetupRunning ? L.T("正在配置…")
+                BtnSandbox.IsEnabled = (sbOk || _sandboxNeedsEnable) && !setupBusy;
+                BtnSandbox.Content = setupBusy ? busyText
                     : _sandboxNeedsEnable ? L.T("启用沙盒功能")
                     : Providers.SandboxProvider.IsRunning() ? L.T("沙盒运行中")
                     : L.T("启动沙盒桌面");
@@ -203,13 +272,35 @@ namespace ParaDesk.Shell
             // 录制可能由热键或托盘发起，那两条路径不经过本窗口。
             // 不在这里同步，录制页会一直显示"未在录制"、按钮状态也是错的。
             if (PageRecord != null && PageRecord.Visibility == Visibility.Visible)
-                RefreshRecording(false);
+                RefreshRecording(attachedChanged);
             else
                 UpdateRecordingStatus();
 
             // 刷新会把界面文案重新赋值成中文，所以翻译必须在最后再走一遍
             Localizer.Translate(this);
+
+            UpdateNotice();
         }
+
+        private sealed class StatusTone
+        {
+            public readonly SolidColorBrush Fore;
+            public readonly SolidColorBrush Tint;
+
+            public StatusTone(byte r, byte g, byte b)
+            {
+                Fore = new SolidColorBrush(Color.FromRgb(r, g, b));
+                Fore.Freeze();
+                Tint = new SolidColorBrush(Color.FromArgb(0x28, r, g, b));
+                Tint.Freeze();
+            }
+        }
+
+        private static readonly StatusTone ToneBlue = new StatusTone(0x00, 0x78, 0xD4);
+        private static readonly StatusTone ToneAmber = new StatusTone(0xB8, 0x86, 0x0B);
+        private static readonly StatusTone ToneGreen = new StatusTone(0x10, 0x89, 0x3E);
+        private static readonly StatusTone ToneRed = new StatusTone(0xC4, 0x2B, 0x1C);
+        private static readonly StatusTone ToneGray = new StatusTone(0x8A, 0x88, 0x86);
 
         /// <summary>
         /// 状态卡片。四种状态各有自己的配色、图标、徽章文案，
@@ -217,7 +308,8 @@ namespace ParaDesk.Shell
         /// </summary>
         private void UpdateStatusCard(EnvironmentReport env, DesktopProfile p, bool attached, bool exists)
         {
-            string hex, title, detail, badge;
+            StatusTone tone;
+            string title, detail, badge;
             var symbol = global::Wpf.Ui.Controls.SymbolRegular.Desktop24;
             bool busy = false;
 
@@ -225,38 +317,40 @@ namespace ParaDesk.Shell
 
             if (attached && surfaceState == Rdp.SurfaceState.Connecting)
             {
-                hex = "#0078D4"; title = L.T("正在连接…"); badge = L.T("连接中"); busy = true;
+                tone = ToneBlue; title = L.T("正在连接…"); badge = L.T("连接中"); busy = true;
                 symbol = global::Wpf.Ui.Controls.SymbolRegular.PlugConnected24;
                 detail = L.T("首次连接会为你的账户建立第二个登录，可能需要一两分钟。");
             }
             else if (attached && surfaceState == Rdp.SurfaceState.Reconnecting)
             {
-                hex = "#B8860B"; title = L.T("正在重连…"); badge = L.T("重连中"); busy = true;
+                tone = ToneAmber; title = L.T("正在重连…"); badge = L.T("重连中"); busy = true;
                 symbol = global::Wpf.Ui.Controls.SymbolRegular.ArrowSync24;
                 detail = L.T("连接中断，正在自动恢复。分身桌面里的程序不受影响。");
             }
             else if (attached)
             {
-                hex = "#10893E"; title = L.T("分身桌面运行中"); badge = L.T("运行中");
+                tone = ToneGreen; title = L.T("分身桌面运行中"); badge = L.T("运行中");
                 symbol = global::Wpf.Ui.Controls.SymbolRegular.CheckmarkCircle24;
                 detail = L.T("在里面打开终端即可开始工作；你的主屏键鼠不受影响。");
-                if (p.ViewOnly) detail = L.T("已开启仅查看：你的键鼠不会作用到分身桌面。") + detail;
+                if (p.ViewOnly)
+                    detail = L.T("已开启仅查看：你的键鼠不会作用到分身桌面。") +
+                             (L.Current == "en" ? " " : "") + detail;
             }
             else if (exists)
             {
-                hex = "#B8860B"; title = L.T("已收起（后台运行中）"); badge = L.T("后台");
+                tone = ToneAmber; title = L.T("已收起（后台运行中）"); badge = L.T("后台");
                 symbol = global::Wpf.Ui.Controls.SymbolRegular.EyeOff24;
                 detail = L.T("分身桌面里的程序仍在运行。点「重新接入」可再次看到画面。");
             }
             else if (!env.ReadyToStart)
             {
-                hex = "#C42B1C"; title = L.T("尚未就绪"); badge = L.T("需配置");
+                tone = ToneRed; title = L.T("尚未就绪"); badge = L.T("需配置");
                 symbol = global::Wpf.Ui.Controls.SymbolRegular.Warning24;
                 detail = env.NextAction ?? L.T("环境检查未通过。");
             }
             else
             {
-                hex = "#8A8886"; title = L.T("未启动"); badge = L.T("就绪");
+                tone = ToneGray; title = L.T("未启动"); badge = L.T("就绪");
                 symbol = global::Wpf.Ui.Controls.SymbolRegular.Desktop24;
                 detail = L.T("一切就绪，点「启动桌面」即可在选定显示器上开出分身桌面。");
             }
@@ -267,17 +361,10 @@ namespace ParaDesk.Shell
             StatusIcon.Symbol = symbol;
             StatusProgress.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
 
-            try
-            {
-                var c = (Color)ColorConverter.ConvertFromString(hex);
-                StatusIcon.Foreground = new SolidColorBrush(c);
-                StatusBadgeText.Foreground = new SolidColorBrush(c);
-                // 同色低透明度做底，深浅主题下都成立
-                var tint = Color.FromArgb(0x28, c.R, c.G, c.B);
-                StatusIconBg.Background = new SolidColorBrush(tint);
-                StatusBadge.Background = new SolidColorBrush(tint);
-            }
-            catch { }
+            StatusIcon.Foreground = tone.Fore;
+            StatusBadgeText.Foreground = tone.Fore;
+            StatusIconBg.Background = tone.Tint;
+            StatusBadge.Background = tone.Tint;
 
             // 指标区
             bool showMetrics = attached || exists;
@@ -296,7 +383,8 @@ namespace ParaDesk.Shell
             MetricMonitor.Text = mon != null ? MonitorNaming.NameOf(mon) : "—";
 
             uint sid = SystemStatus.ChildSessionId();
-            MetricSession.Text = (sid == 0xFFFFFFFF || sid == 0) ? "—" : sid.ToString();
+            MetricSession.Text = (sid == ParaDesk.Native.NativeMethods.NoChildSession || sid == 0)
+                ? "—" : sid.ToString();
         }
 
         private static string FormatUptime(DateTime? since)
@@ -307,6 +395,32 @@ namespace ParaDesk.Shell
             if (d.TotalHours >= 1)
                 return ((int)d.TotalHours) + ":" + d.Minutes.ToString("00") + ":" + d.Seconds.ToString("00");
             return d.Minutes.ToString("00") + ":" + d.Seconds.ToString("00");
+        }
+
+        private void UpdateNotice()
+        {
+            var n = _app.LastNotice;
+            if (n == null)
+            {
+                NoticePanel.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            string title = string.IsNullOrEmpty(n.Title) ? L.T("来自分身桌面的提醒") : n.Title;
+            var severity = n.Level == ParaDesk.Ui.NoticeInfo.LevelError
+                ? global::Wpf.Ui.Controls.InfoBarSeverity.Error
+                : n.Level == ParaDesk.Ui.NoticeInfo.LevelWarn
+                    ? global::Wpf.Ui.Controls.InfoBarSeverity.Warning
+                    : global::Wpf.Ui.Controls.InfoBarSeverity.Informational;
+
+            SetBar(NoticeBar, severity, title + "  ·  " + n.Time.ToString("HH:mm"), n.Body);
+            NoticePanel.Visibility = Visibility.Visible;
+        }
+
+        private void OnDismissNotice(object sender, RoutedEventArgs e)
+        {
+            NoticePanel.Visibility = Visibility.Collapsed;
+            _app.DismissNotice();
         }
 
         // ---------------- 动作 ----------------
@@ -342,6 +456,8 @@ namespace ParaDesk.Shell
         /// </summary>
         private void RunSetupThen(Action next)
         {
+            if (RejectIfSetupBusy()) return;
+
             var r = MessageBox.Show(this,
                 L.T("分身桌面需要先让 Windows 打开「子会话」功能，这要一次管理员授权（只需一次，之后不再需要）。") +
                 "\r\n\r\n" + L.T("同时会关掉跨设备恢复，并挡掉它在分身桌面里弹的那个系统错误框。") +
@@ -355,20 +471,21 @@ namespace ParaDesk.Shell
 
             _app.RunSetup(delegate(SetupResult res)
             {
+                if (res == SetupResult.Success || res == SetupResult.RebootRequired)
+                    ApplyErrorDialogFix();
+
                 if (!IsLoaded) throw new ObjectDisposedException("MainWindow");
 
                 switch (res)
                 {
                     case SetupResult.Success:
-                        ApplyErrorDialogFix();
                         SystemStatus.Invalidate();
                         RefreshAll();
+                        InvalidateDiagnostics();
                         if (next != null) next();
                         return;
                     case SetupResult.RebootRequired:
-                        // 配置写进去了、只差重启，防错误框这步照样该做。
                         // 提权进程已经解释过要重启，这里不重复弹窗
-                        ApplyErrorDialogFix();
                         break;
                     case SetupResult.Cancelled:
                         Info(L.T("已取消（未获得管理员授权）。"));
@@ -379,23 +496,27 @@ namespace ParaDesk.Shell
                 }
                 SystemStatus.Invalidate();
                 RefreshAll();
+                InvalidateDiagnostics();
             });
         }
 
-        /// <summary>
-        /// 配置系统时顺带把"分身桌面里弹系统错误框"这件事处理掉。
-        ///
-        /// 用户不该为了不看见一个 Windows 自己的缺陷，而去诊断页翻一个开关——
-        /// 配置一次就该全都弄好。已经装过就不重复写。
-        /// </summary>
-        private void ApplyErrorDialogFix()
+        private static void ApplyErrorDialogFix()
         {
-            if (CrossDeviceSettings.IsEnabled()) return;
+            try
+            {
+                if (CrossDeviceSettings.ApplyAll(true))
+                    Log.Info("配置系统时已启用错误框拦截");
+                else
+                    Log.Warn("配置系统时启用错误框拦截失败");
+            }
+            catch (Exception ex) { Log.Error("配置系统时启用错误框拦截失败", ex); }
+        }
 
-            if (CrossDeviceSettings.ApplyAll(true))
-                Log.Info("配置系统时已启用错误框拦截");
-            else
-                Log.Warn("配置系统时启用错误框拦截失败");
+        private bool RejectIfSetupBusy()
+        {
+            if (!_app.SetupRunning) return false;
+            Info(L.T("系统配置或撤销正在进行中，请等它完成后再试。"));
+            return true;
         }
 
         /// <summary>诊断页的"重新配置"：只配置，不接着启动。</summary>
@@ -445,16 +566,58 @@ namespace ParaDesk.Shell
 
         // ---------------- 诊断页 ----------------
 
-        /// <summary>
-        /// 逐项列出环境检查结果。与首次运行向导第 2 步同样的呈现，
-        /// 但这里是随时可查的——排障时用户最想知道的就是"到底哪一项没过"。
-        /// </summary>
-        private void BuildDiagnostics()
-        {
-            // 打开诊断页时要看的是当前真实状态，不能用缓存
-            SystemStatus.Invalidate();
-            var env = SystemStatus.Check();
+        private bool _diagLoaded;
+        private bool _diagChecking;
 
+        private void StartDiagnosticsCheck()
+        {
+            if (_diagChecking || _closed) return;
+            _diagChecking = true;
+
+            BtnDiagRecheck.IsEnabled = false;
+            SetBar(DiagBar, global::Wpf.Ui.Controls.InfoBarSeverity.Informational,
+                L.T("正在检查环境…"),
+                L.T("通常一两秒即可完成。"));
+
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                EnvironmentReport env = null;
+                bool captureOk = false;
+                string error = null;
+                try
+                {
+                    env = SystemStatus.Check();
+                    captureOk = Recording.CaptureItemFactory.IsSupported;
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("环境检查失败", ex);
+                    error = ex.Message;
+                }
+
+                try
+                {
+                    Dispatcher.BeginInvoke((Action)delegate { OnDiagnosticsChecked(env, captureOk, error); });
+                }
+                catch (Exception ex) { Log.Error("回填环境检查结果失败", ex); }
+            });
+        }
+
+        private void OnDiagnosticsChecked(EnvironmentReport env, bool captureOk, string error)
+        {
+            _diagChecking = false;
+            if (_closed) return;
+            BtnDiagRecheck.IsEnabled = true;
+
+            if (env == null)
+            {
+                SetBar(DiagBar, global::Wpf.Ui.Controls.InfoBarSeverity.Error,
+                    L.T("环境检查失败"),
+                    error ?? L.T("详见日志。"));
+                return;
+            }
+
+            _diagLoaded = true;
             DiagCheckList.Children.Clear();
 
             // Fix 列：只有"提权跑一次配置就能解决"的项才给按钮。
@@ -472,23 +635,32 @@ namespace ParaDesk.Shell
             // 通道未就绪多半是"配置写好了但还没重启"，修不了，只能等重启
             AddDiagRow(L.T("子会话通道"), env.TransportReady, L.T("可用"),
                 SystemStatus.DescribeTransportError(env.TransportStatus), false);
-            AddDiagRow(L.T("屏幕捕获（录制）"), Recording.CaptureItemFactory.IsSupported,
+            AddDiagRow(L.T("屏幕捕获（录制）"), captureOk,
                 L.T("支持"), L.T("需要 Windows 10 1903 或更高版本"), false);
 
             if (env.ReadyToStart)
             {
-                DiagBar.Severity = global::Wpf.Ui.Controls.InfoBarSeverity.Success;
-                DiagBar.Title = L.T("环境正常");
-                DiagBar.Message = L.T("所有前置条件均已满足。");
+                SetBar(DiagBar, global::Wpf.Ui.Controls.InfoBarSeverity.Success,
+                    L.T("环境正常"),
+                    L.T("所有前置条件均已满足。"));
             }
             else
             {
-                DiagBar.Severity = global::Wpf.Ui.Controls.InfoBarSeverity.Warning;
-                DiagBar.Title = L.T("有未通过项");
-                DiagBar.Message = env.NextAction ?? L.T("详见上方列表。");
+                SetBar(DiagBar, global::Wpf.Ui.Controls.InfoBarSeverity.Warning,
+                    L.T("有未通过项"),
+                    env.NextAction ?? L.T("详见上方列表。"));
             }
+        }
 
-            Localizer.Translate(PageDiag);
+        private void InvalidateDiagnostics()
+        {
+            _diagLoaded = false;
+            if (PageDiag != null && PageDiag.Visibility == Visibility.Visible) StartDiagnosticsCheck();
+        }
+
+        private void OnDiagRecheck(object sender, RoutedEventArgs e)
+        {
+            StartDiagnosticsCheck();
         }
 
         private void AddDiagRow(string name, bool ok, string okText, string failText, bool fixable)
@@ -506,8 +678,7 @@ namespace ParaDesk.Shell
                 Symbol = ok ? global::Wpf.Ui.Controls.SymbolRegular.CheckmarkCircle24
                             : global::Wpf.Ui.Controls.SymbolRegular.ErrorCircle24,
                 FontSize = 17,
-                Foreground = new SolidColorBrush(ok
-                    ? Color.FromRgb(0x10, 0x89, 0x3E) : Color.FromRgb(0xC4, 0x2B, 0x1C)),
+                Foreground = ok ? ToneGreen.Fore : ToneRed.Fore,
                 VerticalAlignment = VerticalAlignment.Center,
             };
             Grid.SetColumn(icon, 0);
@@ -553,14 +724,107 @@ namespace ParaDesk.Shell
         /// <summary>
         /// 逐项修复。三个可修项（子会话功能／监听器／服务）都由同一个提权配置一次性搞定，
         /// 所以点哪一行都是跑同一件事——不必为每项单独写一条提权路径，
-        /// 也避免用户被连问三次管理员授权。
         /// </summary>
         private void OnFixDiag(object sender, RoutedEventArgs e)
         {
-            RunSetupThen(delegate
+            RunSetupThen(null);
+        }
+
+        private bool _bundleBusy;
+
+        private void OnExportDiagBundle(object sender, RoutedEventArgs e)
+        {
+            if (_bundleBusy) return;
+            _bundleBusy = true;
+            BtnDiagBundle.IsEnabled = false;
+            BtnDiagBundle.Content = L.T("正在生成…");
+            ShowBar(DiagActionBar, global::Wpf.Ui.Controls.InfoBarSeverity.Informational,
+                L.T("正在生成诊断包…"), L.T("正在收集日志与环境信息。"));
+
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
             {
+                string err = null, path = null;
+                try { path = ParaDesk.Diagnostics.DiagBundle.Create(null, out err); }
+                catch (Exception ex)
+                {
+                    Log.Error("生成诊断包失败", ex);
+                    err = ex.Message;
+                }
+
+                try
+                {
+                    Dispatcher.BeginInvoke((Action)delegate { OnDiagBundleDone(path, err); });
+                }
+                catch (Exception ex) { Log.Error("回填诊断包结果失败", ex); }
+            });
+        }
+
+        private void OnDiagBundleDone(string path, string err)
+        {
+            _bundleBusy = false;
+            if (_closed) return;
+            BtnDiagBundle.IsEnabled = true;
+            BtnDiagBundle.Content = L.T("导出诊断包");
+
+            if (string.IsNullOrEmpty(path))
+            {
+                ShowBar(DiagActionBar, global::Wpf.Ui.Controls.InfoBarSeverity.Error,
+                    L.T("生成诊断包失败"), err ?? L.T("详见日志。"));
+                return;
+            }
+
+            ShowBar(DiagActionBar, global::Wpf.Ui.Controls.InfoBarSeverity.Success,
+                L.T("已生成诊断包"), path);
+            RevealInExplorer(path);
+        }
+
+        private void OnUndoSetup(object sender, RoutedEventArgs e)
+        {
+            if (RejectIfSetupBusy()) return;
+
+            string msg =
+                L.T("将撤销 ParaDesk 对系统所做的配置：") + "\r\n\r\n" +
+                "• " + L.T("关闭 Windows 的子会话功能（第一次配置前就已开启的保持不变）") + "\r\n" +
+                "• " + L.T("按第一次配置前记录的原值，恢复远程桌面监听器、防火墙规则、免密登录的凭据委派、「始终提示输入密码」和 TermService 启动类型") + "\r\n" +
+                "• " + L.T("移除分身桌面里的守护程序启动项") + "\r\n\r\n" +
+                L.T("如果没有第一次配置前的记录（例如由旧版本配置过），远程桌面监听器、防火墙规则、「始终提示输入密码」和 TermService 启动类型的原值无从得知，将保持不变，只删除 ParaDesk 写入的凭据委派条目；不需要远程桌面的话，可以在 Windows「设置 → 系统 → 远程桌面」里关闭。") + "\r\n\r\n" +
+                L.T("需要一次管理员授权。之后若还要使用分身桌面，需要重新配置并重启电脑。");
+            if (_app.DesktopAttached || SystemStatus.HasChildSession())
+                msg += "\r\n\r\n" + L.T("分身桌面正在运行，建议先关闭它，里面的程序会随配置撤销而无法继续使用。");
+            msg += "\r\n\r\n" + L.T("确定撤销吗？");
+
+            if (MessageBox.Show(this, msg, AppInfo.ProductName, MessageBoxButton.OKCancel,
+                    MessageBoxImage.Warning) != MessageBoxResult.OK) return;
+
+            BtnUndoSetup.IsEnabled = false;
+            BtnUndoSetup.Content = L.T("正在撤销…");
+
+            _app.RunUndoSetup(delegate(SetupResult res)
+            {
+                if (!IsLoaded) throw new ObjectDisposedException("MainWindow");
+
+                BtnUndoSetup.IsEnabled = true;
+                BtnUndoSetup.Content = L.T("撤销配置…");
+                switch (res)
+                {
+                    case SetupResult.Success:
+                        ShowBar(DiagActionBar, global::Wpf.Ui.Controls.InfoBarSeverity.Success,
+                            L.T("撤销配置完成"), L.T("已撤销 ParaDesk 对系统所做的配置。"));
+                        break;
+                    case SetupResult.RebootRequired:
+                        ShowBar(DiagActionBar, global::Wpf.Ui.Controls.InfoBarSeverity.Warning,
+                            L.T("撤销配置完成"), L.T("已撤销配置，重启电脑后完全生效。"));
+                        break;
+                    case SetupResult.Cancelled:
+                        Info(L.T("已取消（未获得管理员授权）。"));
+                        break;
+                    default:
+                        Warn(L.T("撤销配置未完成，详见日志：") + "\r\n" + Log.Path0);
+                        break;
+                }
                 SystemStatus.Invalidate();
-                BuildDiagnostics();
+                RefreshAll();
+                InvalidateDiagnostics();
             });
         }
 
@@ -628,7 +892,11 @@ namespace ParaDesk.Shell
                 Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
                 AppInfo.ProductName + "Shared");
             try { System.IO.Directory.CreateDirectory(shared); }
-            catch { shared = null; }
+            catch (Exception ex)
+            {
+                Log.Warn("创建沙盒共享文件夹失败: " + ex.Message);
+                shared = null;
+            }
 
             var confirm = MessageBox.Show(this,
                 L.T("沙盒桌面是即抛环境：关闭后里面的一切都会丢失，且与主桌面不共享文件。") + "\r\n\r\n" +
@@ -677,8 +945,8 @@ namespace ParaDesk.Shell
 
             // 成功与失败必须分开统计——之前把失败信息也拼进同一段文字，
             // 结果全部失败时仍然显示"已创建以下快捷方式"，等于骗用户。
-            var ok = new System.Text.StringBuilder();
-            var bad = new System.Text.StringBuilder();
+            var ok = new StringBuilder();
+            var bad = new StringBuilder();
             foreach (var b in browsers)
             {
                 string err;
@@ -698,6 +966,204 @@ namespace ParaDesk.Shell
                          L.T("把它拖进分身桌面里使用即可（两边共用同一个桌面文件夹）。");
             if (bad.Length > 0) msg += "\r\n\r\n" + L.T("以下未能创建：") + "\r\n" + bad;
             Info(msg);
+        }
+
+        private const int StartupSaveDelayMs = 600;
+        private DispatcherTimer _startupSaveTimer;
+        private DesktopProfile _startupEditProfile;
+
+        private DesktopProfile _startupShownProfile;
+
+        private void RefreshInsideDesktop(DesktopProfile p)
+        {
+            bool stale = !ReferenceEquals(_startupShownProfile, p);
+
+            if (stale && _startupEditProfile != null) SaveStartupCommand();
+
+            bool focused = TbStartupCmd.IsKeyboardFocusWithin || TbStartupDir.IsKeyboardFocusWithin;
+            if (_startupEditProfile == null && (stale || !focused))
+            {
+                SetTextIfDifferent(TbStartupCmd, p.StartupCommand);
+                SetTextIfDifferent(TbStartupDir, p.StartupWorkingDir);
+                _startupShownProfile = p;
+                if (focused)
+                {
+                    TbStartupCmd.CaretIndex = TbStartupCmd.Text.Length;
+                    TbStartupDir.CaretIndex = TbStartupDir.Text.Length;
+                }
+            }
+
+            SwKeepAwake.IsChecked = p.KeepAwake;
+            PopulateDesktopAudio(p);
+        }
+
+        private DesktopProfile StartupEditTarget()
+        {
+            var s = _app.Settings;
+            var shown = _startupShownProfile;
+            if (shown != null && s.Profiles != null && s.Profiles.Contains(shown)) return shown;
+            return s.GetActiveProfile();
+        }
+
+        private static void SetTextIfDifferent(System.Windows.Controls.TextBox box, string value)
+        {
+            string v = value ?? "";
+            if (!string.Equals(box.Text, v, StringComparison.Ordinal)) box.Text = v;
+        }
+
+        private void OnStartupCmdChanged(object sender, TextChangedEventArgs e)
+        {
+            if (_loading || _startupSaveTimer == null) return;
+            if (_startupEditProfile == null) _startupEditProfile = StartupEditTarget();
+            _startupSaveTimer.Stop();
+            _startupSaveTimer.Start();
+        }
+
+        private void OnStartupCmdLostFocus(object sender, RoutedEventArgs e)
+        {
+            if (_startupEditProfile != null) SaveStartupCommand();
+        }
+
+        private void SaveStartupCommand()
+        {
+            if (_startupSaveTimer != null) _startupSaveTimer.Stop();
+            var p = _startupEditProfile;
+            _startupEditProfile = null;
+            if (p == null) return;
+
+            var s = _app.Settings;
+            if (s.Profiles == null || !s.Profiles.Contains(p)) return;
+
+            string cmd = CleanText(TbStartupCmd.Text);
+            string dir = CleanText(TbStartupDir.Text);
+            if (string.Equals(p.StartupCommand, cmd, StringComparison.Ordinal) &&
+                string.Equals(p.StartupWorkingDir, dir, StringComparison.Ordinal)) return;
+
+            p.StartupCommand = cmd;
+            p.StartupWorkingDir = dir;
+            SettingsStore.Save(s);
+            Log.Info("方案「" + p.Name + "」的登录后自动运行已改为: " + (cmd == null ? "（无）" : cmd.Length + " 个字符") +
+                     (dir != null ? "（工作目录 " + dir + "）" : ""));
+
+            if (cmd != null && !CrossDeviceSettings.EnsureAgentRegistered())
+            {
+                ShowInsideBar(L.T("未能注册分身桌面里的守护程序"),
+                    L.T("登录后自动运行和保持唤醒都靠它执行，没注册时不会生效。详见日志。"));
+                return;
+            }
+
+            if (dir != null)
+            {
+                string full = NormalizeStartupDir(dir);
+                if (full == null || (!IsNetworkPath(full) && !LocalDirExists(full)))
+                {
+                    ShowInsideBar(L.T("工作目录不存在"), dir);
+                    return;
+                }
+            }
+
+            HideBar(InsideBar);
+        }
+
+        private static string NormalizeStartupDir(string dir)
+        {
+            if (dir == null) return null;
+            try
+            {
+                string d = dir.Trim().Trim('"');
+                if (d.Length == 0) return null;
+                d = Environment.ExpandEnvironmentVariables(d);
+                if (!System.IO.Path.IsPathRooted(d))
+                {
+                    string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                    if (string.IsNullOrEmpty(home)) return null;
+                    d = System.IO.Path.Combine(home, d);
+                }
+                return d;
+            }
+            catch { return null; }
+        }
+
+        private static bool IsNetworkPath(string full)
+        {
+            try
+            {
+                if (full.Length >= 2 && (full[0] == '\\' || full[0] == '/') && (full[1] == '\\' || full[1] == '/'))
+                    return true;
+                if (full.Length >= 2 && full[1] == ':' && char.IsLetter(full[0]))
+                    return new System.IO.DriveInfo(full.Substring(0, 1)).DriveType == System.IO.DriveType.Network;
+                return false;
+            }
+            catch { return true; }
+        }
+
+        private static bool LocalDirExists(string full)
+        {
+            try { return System.IO.Directory.Exists(full); }
+            catch { return false; }
+        }
+
+        private static string CleanText(string s)
+        {
+            if (s == null) return null;
+            s = s.Trim();
+            return s.Length == 0 ? null : s;
+        }
+
+        private void OnPickStartupDir(object sender, RoutedEventArgs e)
+        {
+            string start = NormalizeStartupDir(CleanText(TbStartupDir.Text));
+            if (start == null || IsNetworkPath(start) || !LocalDirExists(start))
+                start = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+            IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+            string picked = ParaDesk.Ui.FolderPicker.Pick(hwnd, L.T("选择登录后自动运行的工作目录"), start);
+            if (string.IsNullOrEmpty(picked)) return;
+
+            if (_startupEditProfile == null) _startupEditProfile = StartupEditTarget();
+            TbStartupDir.Text = picked;
+            SaveStartupCommand();
+        }
+
+        private void OnKeepAwake(object sender, RoutedEventArgs e)
+        {
+            if (_loading) return;
+            var p = _app.Settings.GetActiveProfile();
+            p.KeepAwake = SwKeepAwake.IsChecked == true;
+            SettingsStore.Save(_app.Settings);
+
+            if (p.KeepAwake && !CrossDeviceSettings.EnsureAgentRegistered())
+                ShowInsideBar(L.T("未能注册分身桌面里的守护程序"),
+                    L.T("登录后自动运行和保持唤醒都靠它执行，没注册时不会生效。详见日志。"));
+            else
+                HideBar(InsideBar);
+        }
+
+        private void PopulateDesktopAudio(DesktopProfile p)
+        {
+            CbDesktopAudio.Items.Clear();
+            CbDesktopAudio.Items.Add(new ChoiceItem((int)DesktopAudioMode.Local, L.T("在本机播放")));
+            CbDesktopAudio.Items.Add(new ChoiceItem((int)DesktopAudioMode.Mute, L.T("静音")));
+            if (p.DesktopAudio == DesktopAudioMode.Remote)
+                CbDesktopAudio.Items.Add(new ChoiceItem((int)DesktopAudioMode.Remote, L.T("留在分身桌面")));
+            SelectChoice(CbDesktopAudio, (int)p.DesktopAudio);
+        }
+
+        private void OnDesktopAudioChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_loading) return;
+            var item = CbDesktopAudio.SelectedItem as ChoiceItem;
+            if (item == null) return;
+            var p = _app.Settings.GetActiveProfile();
+            if ((int)p.DesktopAudio == item.Value) return;
+            p.DesktopAudio = (DesktopAudioMode)item.Value;
+            SettingsStore.Save(_app.Settings);
+            Log.Info("方案「" + p.Name + "」的分身桌面声音改为 " + p.DesktopAudio);
+        }
+
+        private void ShowInsideBar(string title, string message)
+        {
+            ShowBar(InsideBar, global::Wpf.Ui.Controls.InfoBarSeverity.Warning, title, message);
         }
 
         // ---------------- 录制 ----------------
@@ -732,14 +1198,16 @@ namespace ParaDesk.Shell
 
                 CbRecAudio.SelectedIndex = (int)o.Audio;
                 SwRecCursor.IsChecked = o.CaptureCursor;
+                SwRecAuto.IsChecked = o.AutoRecordWithDesktop;
                 RecFolder.Text = string.IsNullOrEmpty(o.OutputFolder)
                     ? Recording.RecordingOptions.DefaultFolder : o.OutputFolder;
 
-                if (CbRecFps.Items.Count == 0)
-                {
-                    foreach (int f in new[] { 15, 24, 30, 60 }) CbRecFps.Items.Add(f + " FPS");
-                }
-                CbRecFps.SelectedIndex = FpsIndex(o.FrameRate);
+                if (CbRecFps.Items.Count == 0 || IndexOfChoice(CbRecFps, o.FrameRate) < 0)
+                    PopulateRecFps(o.FrameRate);
+                SelectChoice(CbRecFps, o.FrameRate);
+                if (CbRecSegment.Items.Count == 0 || IndexOfChoice(CbRecSegment, o.SegmentMinutes) < 0)
+                    PopulateRecSegments(o.SegmentMinutes);
+                SelectChoice(CbRecSegment, o.SegmentMinutes);
                 CbRecBitrate.SelectedIndex = BitrateIndex(o.BitrateMbps);
 
                 RecAudioHint.Text = L.T("系统声音录的是本机所有播放的声音（含分身桌面）；麦克风需在隐私设置中允许桌面应用访问。");
@@ -748,12 +1216,13 @@ namespace ParaDesk.Shell
                 CbRecTarget.IsEnabled = !busy;
                 CbRecFps.IsEnabled = !busy;
                 CbRecBitrate.IsEnabled = !busy;
+                CbRecSegment.IsEnabled = !busy;
                 SwRecCursor.IsEnabled = !busy;
                 BtnRecStart.IsEnabled = !busy && CbRecTarget.Items.Count > 0;
                 BtnRecStop.IsEnabled = busy;
                 BtnRecPause.IsEnabled = busy;
                 BtnRecPause.Content = _app.IsRecordingPaused ? L.T("继续") : L.T("暂停");
-                BtnScreenshot.IsEnabled = CbRecTarget.Items.Count > 0;
+                BtnScreenshot.IsEnabled = !_screenshotBusy;
 
                 UpdateRecordingStatus();
             }
@@ -763,7 +1232,7 @@ namespace ParaDesk.Shell
         private void UpdateRecordingStatus()
         {
             bool busy = _app.IsRecording;
-            string hex = busy ? "#C42B1C" : "#8A8886";
+            var tone = busy ? ToneRed : ToneGray;
 
             RecTitle.Text = busy ? L.T("正在录制") : L.T("未在录制");
             RecDetail.Text = busy
@@ -774,14 +1243,9 @@ namespace ParaDesk.Shell
                 : global::Wpf.Ui.Controls.SymbolRegular.Video24;
             RecElapsed.Text = busy ? FormatUptime(_app.RecordingStartedAt) : "";
 
-            try
-            {
-                var c = (Color)ColorConverter.ConvertFromString(hex);
-                RecIcon.Foreground = new SolidColorBrush(c);
-                RecIconBg.Background = new SolidColorBrush(Color.FromArgb(0x28, c.R, c.G, c.B));
-                RecElapsed.Foreground = new SolidColorBrush(c);
-            }
-            catch { }
+            RecIcon.Foreground = tone.Fore;
+            RecIconBg.Background = tone.Tint;
+            RecElapsed.Foreground = tone.Fore;
         }
 
         private string SelectedTargetKey()
@@ -795,13 +1259,45 @@ namespace ParaDesk.Shell
             return t.Kind + "|" + (t.DeviceName ?? t.Title);
         }
 
-        private static readonly int[] RecFps = { 15, 24, 30, 60 };
+        private static readonly int[] RecFps = { 1, 2, 5, 15, 24, 30, 60 };
+        private const int TimelapseMaxFps = 5;
+        private static readonly int[] RecSegments = { 0, 15, 30, 60 };
         private static readonly int[] RecBitrates = { 8, 12, 20, 40 };
 
-        private static int FpsIndex(int fps)
+        private void PopulateRecFps(int current)
         {
-            for (int i = 0; i < RecFps.Length; i++) if (RecFps[i] == fps) return i;
-            return 2;
+            CbRecFps.Items.Clear();
+            bool found = false;
+            foreach (int f in RecFps)
+            {
+                CbRecFps.Items.Add(new ChoiceItem(f, FpsLabel(f)));
+                if (f == current) found = true;
+            }
+            if (!found && current > 0) CbRecFps.Items.Add(new ChoiceItem(current, FpsLabel(current)));
+        }
+
+        private static string FpsLabel(int fps)
+        {
+            return fps <= TimelapseMaxFps
+                ? string.Format(L.T("{0} FPS（延时）"), fps)
+                : fps + " FPS";
+        }
+
+        private void PopulateRecSegments(int current)
+        {
+            CbRecSegment.Items.Clear();
+            bool found = false;
+            foreach (int m in RecSegments)
+            {
+                CbRecSegment.Items.Add(new ChoiceItem(m, SegmentLabel(m)));
+                if (m == current) found = true;
+            }
+            if (!found && current > 0) CbRecSegment.Items.Add(new ChoiceItem(current, SegmentLabel(current)));
+        }
+
+        private static string SegmentLabel(int minutes)
+        {
+            return minutes <= 0 ? L.T("不分段") : string.Format(L.T("每 {0} 分钟"), minutes);
         }
 
         private static int BitrateIndex(int mbps)
@@ -823,11 +1319,14 @@ namespace ParaDesk.Shell
             if (_recLoading) return;
             var o = _app.Settings.Recording;
             if (CbRecAudio.SelectedIndex >= 0) o.Audio = (Recording.AudioSource)CbRecAudio.SelectedIndex;
-            if (CbRecFps.SelectedIndex >= 0 && CbRecFps.SelectedIndex < RecFps.Length)
-                o.FrameRate = RecFps[CbRecFps.SelectedIndex];
+            var fps = CbRecFps.SelectedItem as ChoiceItem;
+            if (fps != null) o.FrameRate = fps.Value;
             if (CbRecBitrate.SelectedIndex >= 0 && CbRecBitrate.SelectedIndex < RecBitrates.Length)
                 o.BitrateMbps = RecBitrates[CbRecBitrate.SelectedIndex];
+            var seg = CbRecSegment.SelectedItem as ChoiceItem;
+            if (seg != null) o.SegmentMinutes = seg.Value;
             o.CaptureCursor = SwRecCursor.IsChecked == true;
+            o.AutoRecordWithDesktop = SwRecAuto.IsChecked == true;
             SettingsStore.Save(_app.Settings);
         }
 
@@ -838,17 +1337,18 @@ namespace ParaDesk.Shell
 
             SaveRecOptions();
             string err = _app.StartRecording(target);
+            ShowLastOutput(null);
             if (err != null)
             {
-                RecBar.Severity = global::Wpf.Ui.Controls.InfoBarSeverity.Error;
-                RecBar.Title = L.T("无法开始录制");
-                RecBar.Message = err;
+                SetBar(RecBar, global::Wpf.Ui.Controls.InfoBarSeverity.Error,
+                    L.T("无法开始录制"),
+                    err);
             }
             else
             {
-                RecBar.Severity = global::Wpf.Ui.Controls.InfoBarSeverity.Success;
-                RecBar.Title = L.T("录制已开始");
-                RecBar.Message = L.T("文件将保存到 ") + RecFolder.Text;
+                SetBar(RecBar, global::Wpf.Ui.Controls.InfoBarSeverity.Success,
+                    L.T("录制已开始"),
+                    L.T("文件将保存到 ") + RecFolder.Text);
             }
             RefreshRecording(false);
         }
@@ -859,32 +1359,47 @@ namespace ParaDesk.Shell
             RefreshRecording(false);
         }
 
+        private bool _screenshotBusy;
+
         private void OnScreenshot(object sender, RoutedEventArgs e)
         {
-            var target = CbRecTarget.SelectedItem as Recording.CaptureTarget;
-            if (target == null) { Warn(L.T("请先选择截图目标。")); return; }
-
+            if (_screenshotBusy) return;
+            _screenshotBusy = true;
             BtnScreenshot.IsEnabled = false;
+            BtnScreenshot.Content = L.T("正在截图…");
+
             try
             {
-                string err;
-                string path = Recording.Screenshot.Capture(
-                    target, _app.Settings.Recording.OutputFolder, out err);
-
-                if (path == null)
-                {
-                    RecBar.Severity = global::Wpf.Ui.Controls.InfoBarSeverity.Error;
-                    RecBar.Title = L.T("截图失败");
-                    RecBar.Message = err;
-                }
-                else
-                {
-                    RecBar.Severity = global::Wpf.Ui.Controls.InfoBarSeverity.Success;
-                    RecBar.Title = L.T("已截图");
-                    RecBar.Message = path;
-                }
+                _app.TakeScreenshot(null, delegate(string path, string err) { OnScreenshotDone(path, err); });
             }
-            finally { BtnScreenshot.IsEnabled = true; }
+            catch (Exception ex)
+            {
+                Log.Error("发起截图失败", ex);
+                OnScreenshotDone(null, ex.Message);
+            }
+        }
+
+        private void OnScreenshotDone(string path, string err)
+        {
+            _screenshotBusy = false;
+            if (_closed) return;
+            BtnScreenshot.Content = L.T("截图");
+            BtnScreenshot.IsEnabled = true;
+
+            if (string.IsNullOrEmpty(path))
+            {
+                SetBar(RecBar, global::Wpf.Ui.Controls.InfoBarSeverity.Error,
+                    L.T("截图失败"),
+                    err ?? L.T("详见日志。"));
+                ShowLastOutput(null);
+            }
+            else
+            {
+                SetBar(RecBar, global::Wpf.Ui.Controls.InfoBarSeverity.Success,
+                    L.T("已截图"),
+                    path);
+                ShowLastOutput(path);
+            }
         }
 
         private void OnStopRecording(object sender, RoutedEventArgs e)
@@ -925,7 +1440,65 @@ namespace ParaDesk.Shell
                 System.IO.Directory.CreateDirectory(dir);
                 System.Diagnostics.Process.Start("explorer.exe", "\"" + dir + "\"");
             }
-            catch (Exception ex) { Log.Error("打开录制目录失败", ex); }
+            catch (Exception ex)
+            {
+                Log.Error("打开录制目录失败", ex);
+                Warn(L.T("无法打开文件夹：") + ex.Message);
+            }
+        }
+
+        private string _lastOutputPath;
+
+        private void ShowLastOutput(string path)
+        {
+            _lastOutputPath = string.IsNullOrEmpty(path) ? null : path;
+            RecFileActions.Visibility = _lastOutputPath != null ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private void OnOpenLastOutput(object sender, RoutedEventArgs e)
+        {
+            string path = _lastOutputPath;
+            if (path == null) return;
+            if (!System.IO.File.Exists(path)) { Warn(L.T("文件已不存在：") + path); return; }
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path) { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                Log.Error("打开文件失败: " + path, ex);
+                Warn(L.T("无法打开该文件：") + ex.Message);
+            }
+        }
+
+        private void OnRevealLastOutput(object sender, RoutedEventArgs e)
+        {
+            RevealInExplorer(_lastOutputPath);
+        }
+
+        private void RevealInExplorer(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            try
+            {
+                if (System.IO.File.Exists(path))
+                {
+                    System.Diagnostics.Process.Start("explorer.exe", "/select,\"" + path + "\"");
+                    return;
+                }
+                string dir = System.IO.Path.GetDirectoryName(path);
+                if (string.IsNullOrEmpty(dir) || !System.IO.Directory.Exists(dir))
+                {
+                    Warn(L.T("文件已不存在：") + path);
+                    return;
+                }
+                System.Diagnostics.Process.Start("explorer.exe", "\"" + dir + "\"");
+            }
+            catch (Exception ex)
+            {
+                Log.Error("在资源管理器中定位文件失败: " + path, ex);
+                Warn(L.T("无法打开文件夹：") + ex.Message);
+            }
         }
 
         /// <summary>录制结束后由 AppContext 回调，用于提示结果。</summary>
@@ -936,100 +1509,202 @@ namespace ParaDesk.Shell
                 Dispatcher.BeginInvoke((Action)delegate { OnRecordingFinished(path, error); });
                 return;
             }
+            if (_closed) return;
             if (error == null)
             {
-                RecBar.Severity = global::Wpf.Ui.Controls.InfoBarSeverity.Success;
-                RecBar.Title = L.T("录制完成");
-                RecBar.Message = path;
+                SetBar(RecBar, global::Wpf.Ui.Controls.InfoBarSeverity.Success,
+                    L.T("录制完成"),
+                    path);
+                ShowLastOutput(path);
             }
             else
             {
-                RecBar.Severity = global::Wpf.Ui.Controls.InfoBarSeverity.Error;
-                RecBar.Title = L.T("录制未成功");
-                RecBar.Message = error;
+                SetBar(RecBar, global::Wpf.Ui.Controls.InfoBarSeverity.Error,
+                    L.T("录制未成功"),
+                    error);
+                ShowLastOutput(null);
             }
             RefreshRecording(true);
         }
 
         // ---------------- 热键 ----------------
 
+        private const int HotkeyModMask = 0x1 | 0x2 | 0x4 | 0x8;
+
+        private sealed class HotkeySlot
+        {
+            public readonly string Action;
+            public readonly string Label;
+            public readonly HotkeyBox Box;
+
+            public HotkeySlot(string action, string label, HotkeyBox box)
+            {
+                Action = action;
+                Label = label;
+                Box = box;
+            }
+        }
+
+        private HotkeySlot[] _hotkeySlots;
+
+        private void InitHotkeySlots()
+        {
+            _hotkeySlots = new[]
+            {
+                new HotkeySlot("toggleDesktop", "显示 / 收起分身桌面", HkToggle),
+                new HotkeySlot("toggleViewOnly", "切换「仅查看」", HkViewOnly),
+                new HotkeySlot("toggleRecording", "开始 / 停止录制", HkRecord),
+                new HotkeySlot("screenshot", "截图", HkScreenshot),
+                new HotkeySlot("togglePause", "暂停 / 继续录制", HkPause),
+                new HotkeySlot("detach", "收起分身桌面", HkDetach),
+                new HotkeySlot("pushClipboard", "把剪贴板发送到分身桌面", HkPushClip),
+                new HotkeySlot("pullClipboard", "从分身桌面取回剪贴板", HkPullClip),
+            };
+        }
+
+        private HotkeySlot FindSlot(HotkeyBox box)
+        {
+            if (box == null || _hotkeySlots == null) return null;
+            foreach (var slot in _hotkeySlots) if (ReferenceEquals(slot.Box, box)) return slot;
+            return null;
+        }
+
+        private string ActionLabel(string action)
+        {
+            if (_hotkeySlots != null)
+            {
+                foreach (var slot in _hotkeySlots)
+                    if (string.Equals(slot.Action, action, StringComparison.Ordinal)) return L.T(slot.Label);
+            }
+            return action;
+        }
+
         private static HotkeyBinding FindBinding(AppSettings s, string action)
         {
             if (s.Hotkeys == null) return null;
             foreach (var b in s.Hotkeys)
-                if (string.Equals(b.Action, action, StringComparison.Ordinal)) return b;
+                if (b != null && string.Equals(b.Action, action, StringComparison.Ordinal)) return b;
             return null;
         }
 
-        private static int FindHotkey(AppSettings s, string action)
+        private static void ShowSavedHotkey(AppSettings s, HotkeySlot slot)
         {
-            var b = FindBinding(s, action);
-            return b == null ? 0 : b.Modifiers;
+            var b = FindBinding(s, slot.Action);
+            if (b != null && b.Enabled && b.Key != 0) slot.Box.SetHotkey(b.Modifiers, b.Key);
+            else slot.Box.SetHotkey(0, 0);
         }
 
-        private static int FindHotkeyKey(AppSettings s, string action)
+        private void WarnReservedHotkeys()
         {
-            var b = FindBinding(s, action);
-            return b == null ? 0 : b.Key;
+            if (_hotkeySlots == null) return;
+            var s = _app.Settings;
+            var list = new List<string>();
+            foreach (var slot in _hotkeySlots)
+            {
+                var b = FindBinding(s, slot.Action);
+                if (b == null || !b.Enabled || b.Key == 0) continue;
+                string reason = HotkeyBox.ReservedReason(b.Modifiers, b.Key);
+                if (reason != null) list.Add(L.T(slot.Label) + " — " + reason);
+            }
+            if (list.Count == 0) return;
+
+            SetBar(HotkeyBar, global::Wpf.Ui.Controls.InfoBarSeverity.Warning,
+                L.T("有热键占用了保留的组合键"),
+                string.Format(L.T("以下热键占用了系统或常用程序在用的组合键：{0}"),
+                    string.Join(" / ", list.ToArray())));
+        }
+
+        private static string FindConflictingAction(AppSettings s, string action, int mods, int vk)
+        {
+            if (s.Hotkeys == null || vk == 0) return null;
+            int m = mods & HotkeyModMask;
+            foreach (var b in s.Hotkeys)
+            {
+                if (b == null || !b.Enabled || b.Key == 0) continue;
+                if (string.Equals(b.Action, action, StringComparison.Ordinal)) continue;
+                if ((b.Modifiers & HotkeyModMask) == m && b.Key == vk) return b.Action;
+            }
+            return null;
         }
 
         private void OnHotkeyChanged(object sender, EventArgs e)
         {
             if (_loading) return;
-            var s = _app.Settings;
+            var slot = FindSlot(sender as HotkeyBox);
+            if (slot == null) return;
 
-            Store(s, "toggleDesktop", HkToggle);
-            Store(s, "toggleViewOnly", HkViewOnly);
-            Store(s, "toggleRecording", HkRecord);
+            var s = _app.Settings;
+            int mods = slot.Box.Modifiers;
+            int vk = slot.Box.VirtualKey;
+
+            string other = FindConflictingAction(s, slot.Action, mods, vk);
+            if (other != null)
+            {
+                ShowSavedHotkey(s, slot);
+                SetBar(HotkeyBar, global::Wpf.Ui.Controls.InfoBarSeverity.Warning,
+                    L.T("热键冲突，未保存"),
+                    string.Format(L.T("{0} 与「{1}」冲突：两个动作不能共用一个组合。请换一个，或先清除那一项。"),
+                        HotkeyService.Describe(mods, vk), ActionLabel(other)));
+                return;
+            }
+
+            var binding = FindBinding(s, slot.Action);
+            if (binding == null)
+            {
+                binding = new HotkeyBinding { Action = slot.Action };
+                if (s.Hotkeys == null) s.Hotkeys = new List<HotkeyBinding>();
+                s.Hotkeys.Add(binding);
+            }
+            binding.Modifiers = mods;
+            binding.Key = vk;
+            binding.Enabled = vk != 0;
 
             SettingsStore.Save(s);
+            ViewOnlyQuickHint.Text = DescribeViewOnlyHint(s);
             var failed = _app.ApplyHotkeys();
             if (failed != null && failed.Count > 0)
             {
-                HotkeyBar.Severity = global::Wpf.Ui.Controls.InfoBarSeverity.Warning;
-                HotkeyBar.Title = L.T("有热键注册失败");
-                HotkeyBar.Message = L.T("该组合可能已被其它程序占用，请换一个。");
+                var names = new List<string>();
+                foreach (string a in failed) names.Add(ActionLabel(a));
+                SetBar(HotkeyBar, global::Wpf.Ui.Controls.InfoBarSeverity.Warning,
+                    L.T("有热键注册失败"),
+                    string.Format(L.T("以下热键没注册上，组合可能已被其它程序占用，请换一个：{0}"),
+                        string.Join(" / ", names.ToArray())));
             }
             else
             {
-                HotkeyBar.Severity = global::Wpf.Ui.Controls.InfoBarSeverity.Success;
-                HotkeyBar.Title = L.T("热键已生效");
-                HotkeyBar.Message = L.T("现在可以在任何程序里使用这些组合键。");
+                SetBar(HotkeyBar, global::Wpf.Ui.Controls.InfoBarSeverity.Success,
+                    L.T("热键已生效"),
+                    L.T("现在可以在任何程序里使用这些组合键。"));
             }
-        }
-
-        private static void Store(AppSettings s, string action, HotkeyBox box)
-        {
-            var b = FindBinding(s, action);
-            if (b == null)
-            {
-                b = new HotkeyBinding { Action = action };
-                if (s.Hotkeys == null) s.Hotkeys = new List<HotkeyBinding>();
-                s.Hotkeys.Add(b);
-            }
-            b.Modifiers = box.Modifiers;
-            b.Key = box.Key2;
-            b.Enabled = box.Key2 != 0;
         }
 
         // ---------------- 配置方案 ----------------
 
+        private sealed class ProfileItem
+        {
+            public readonly string Name;
+            public ProfileItem(string name) { Name = name; }
+            public override string ToString() { return Name; }
+        }
+
         private void OnProfileSwitched(object sender, SelectionChangedEventArgs e)
         {
             if (_loading) return;
-            string name = CbProfile.SelectedItem as string;
-            if (string.IsNullOrEmpty(name)) return;
-            if (string.Equals(_app.Settings.ActiveProfile, name, StringComparison.Ordinal)) return;
+            var item = CbProfile.SelectedItem as ProfileItem;
+            if (item == null || string.IsNullOrEmpty(item.Name)) return;
+            if (string.Equals(_app.Settings.ActiveProfile, item.Name, StringComparison.Ordinal)) return;
 
-            _app.Settings.ActiveProfile = name;
-            SettingsStore.Save(_app.Settings);
-            _app.ApplyDisplayChanges();
+            if (_startupEditProfile != null) SaveStartupCommand();
+
+            _app.SelectProfile(item.Name);
             RefreshAll();
-            Log.Info("已切换到方案: " + name);
         }
 
         private void OnProfileAdd(object sender, RoutedEventArgs e)
         {
+            if (_startupEditProfile != null) SaveStartupCommand();
+
             var cur = _app.Settings.GetActiveProfile();
             // 以当前设置为蓝本复制一份，用户改完即得第二套方案
             var copy = new DesktopProfile
@@ -1044,10 +1719,17 @@ namespace ParaDesk.Shell
                 ViewOnly = cur.ViewOnly,
                 AlwaysOnTop = cur.AlwaysOnTop,
                 Clipboard = cur.Clipboard,
+                DesktopAudio = cur.DesktopAudio,
+                StartupCommand = cur.StartupCommand,
+                StartupWorkingDir = cur.StartupWorkingDir,
+                KeepAwake = cur.KeepAwake,
+                WindowX = cur.WindowX,
+                WindowY = cur.WindowY,
+                WindowWidth = cur.WindowWidth,
+                WindowHeight = cur.WindowHeight,
             };
             string name = _app.Settings.AddProfile(copy);
-            _app.Settings.ActiveProfile = name;
-            SettingsStore.Save(_app.Settings);
+            _app.SelectProfile(name);
             RefreshAll();
             Info(string.Format(L.T("已创建方案「{0}」，可以直接修改它的显示设置。"), name));
         }
@@ -1062,9 +1744,14 @@ namespace ParaDesk.Shell
                     AppInfo.ProductName, MessageBoxButton.YesNo, MessageBoxImage.Warning)
                 != MessageBoxResult.Yes) return;
 
+            _startupEditProfile = null;
+            if (_startupSaveTimer != null) _startupSaveTimer.Stop();
+
             if (s.RemoveProfile(name))
             {
                 SettingsStore.Save(s);
+                _app.SelectProfile(s.ActiveProfile);
+                _app.ApplyDisplayChanges();
                 RefreshAll();
                 Log.Info("已删除方案: " + name);
             }
@@ -1124,7 +1811,29 @@ namespace ParaDesk.Shell
         private void OnViewOnly(object sender, RoutedEventArgs e)
         {
             if (_loading) return;
-            _app.SetViewOnly(SwViewOnly.IsChecked == true);
+            var sw = sender as ToggleButton;
+            if (sw == null) return;
+            bool on = sw.IsChecked == true;
+
+            bool was = _loading;
+            _loading = true;
+            try
+            {
+                SwViewOnly.IsChecked = on;
+                SwViewOnlyQuick.IsChecked = on;
+            }
+            finally { _loading = was; }
+
+            _app.SetViewOnly(on);
+        }
+
+        private static string DescribeViewOnlyHint(AppSettings s)
+        {
+            string text = L.T("你的键鼠不会作用到分身桌面；AI 注入的操作不受影响");
+            var b = FindBinding(s, "toggleViewOnly");
+            if (b != null && b.Enabled && b.Key != 0)
+                text += string.Format(L.T("。热键 {0}"), HotkeyService.Describe(b.Modifiers, b.Key));
+            return text;
         }
 
         private void OnTopMost(object sender, RoutedEventArgs e)
@@ -1140,6 +1849,29 @@ namespace ParaDesk.Shell
             s.RunAtStartup = SwStartup.IsChecked == true;
             if (!StartupRegistration.SetEnabled(s.RunAtStartup, s.StartMinimized))
                 Warn(L.T("设置开机自启失败，详见日志。"));
+            SettingsStore.Save(s);
+        }
+
+        private void OnStartMinimized(object sender, RoutedEventArgs e)
+        {
+            if (_loading) return;
+            var s = _app.Settings;
+            s.StartMinimized = SwStartMinimized.IsChecked == true;
+            SettingsStore.Save(s);
+
+            if (StartupRegistration.IsEnabled() && !StartupRegistration.SetEnabled(true, s.StartMinimized))
+                Warn(L.T("设置开机自启失败，详见日志。"));
+        }
+
+        private void OnAppBehaviorChanged(object sender, RoutedEventArgs e)
+        {
+            if (_loading) return;
+            var s = _app.Settings;
+            s.AutoStartDesktop = SwAutoStartDesktop.IsChecked == true;
+            s.CheckUpdates = SwCheckUpdates.IsChecked == true;
+            s.AutoReattach = SwAutoReattach.IsChecked == true;
+            s.ConfirmBeforeClose = SwConfirmClose.IsChecked == true;
+            s.AutoLogoffOnShutdown = SwLogoffOnShutdown.IsChecked == true;
             SettingsStore.Save(s);
         }
 
@@ -1166,47 +1898,173 @@ namespace ParaDesk.Shell
             SettingsStore.Save(_app.Settings);
         }
 
-        /// <summary>
-        /// 只更新「应用」按钮的可用性，**不写注册表**。
-        ///
-        /// 这一项是要提权的整机改动。挂在 SelectionChanged 上时，
-        /// 用键盘在下拉里划过几档就会连着弹几次 UAC、连着写几次注册表——
-        /// 而且中途每一次都真的生效了。改成显式点「应用」，一次意图对应一次提权。
-        /// </summary>
-        private void OnFpsSelectionChanged(object sender, SelectionChangedEventArgs e)
+        private void OnCopyClaudeHooks(object sender, RoutedEventArgs e)
         {
-            if (_loading) return;
-            UpdateApplyFpsState();
+            if (!CopyToClipboard(BuildClaudeHooksJson())) return;
+            ShowBar(AiBar, global::Wpf.Ui.Controls.InfoBarSeverity.Success,
+                L.T("已复制 Claude Code 通知配置"),
+                L.T("把其中的 hooks 合并进 Claude Code 的 settings.json（用户级在 ~/.claude/settings.json，也可以放项目里的 .claude/settings.json）。之后任务完成或需要你确认时，主屏会收到提醒。"));
         }
 
-        private void UpdateApplyFpsState()
+        private void OnCopyCliUsage(object sender, RoutedEventArgs e)
         {
-            var item = CbFps.SelectedItem as FpsItem;
-            if (item == null) { BtnApplyFps.IsEnabled = false; return; }
-
-            // 比较**将要写入的注册表值**而不是帧率本身：
-            // FpsToInterval 与 FrameIntervalToFps 不互逆（60 → 17ms → 读回 59），
-            // 按帧率比会让"其实没变"显示成"可以应用"。
-            int want = PerformanceSettings.FpsToInterval(item.Fps);
-            int? have = PerformanceSettings.GetFrameInterval();
-            BtnApplyFps.IsEnabled = want != (have.HasValue ? have.Value : 0);
+            if (!CopyToClipboard(BuildCliUsage())) return;
+            ShowBar(AiBar, global::Wpf.Ui.Controls.InfoBarSeverity.Success,
+                L.T("已复制命令行用法"),
+                L.T("可以直接贴给分身桌面里的 agent，或写进项目的说明文件，让它在需要时叫你。"));
         }
 
-        private void OnApplyFps(object sender, RoutedEventArgs e)
+        private static string BuildClaudeHooksJson()
         {
-            var item = CbFps.SelectedItem as FpsItem;
-            if (item == null) return;
-            int fps = item.Fps;
+            string exe = "\"" + AppInfo.ExecutablePath + "\"";
+            string done = exe + " --notify --title \"Claude Code\" --body \"" + L.T("任务完成") + "\" --sound";
+            string ask = exe + " --notify --title \"Claude Code\" --body \"" + L.T("需要你确认") + "\" --level warn --sound";
 
-            CbFps.IsEnabled = false;
-            BtnApplyFps.IsEnabled = false;
-            _app.RunSetupFps(fps, delegate(bool ok)
+            var sb = new StringBuilder();
+            sb.Append("{\r\n");
+            sb.Append("  \"hooks\": {\r\n");
+            sb.Append("    \"Stop\": [ { \"hooks\": [ { \"type\": \"command\", \"command\": ")
+              .Append(JsonString(done)).Append(" } ] } ],\r\n");
+            sb.Append("    \"Notification\": [ { \"hooks\": [ { \"type\": \"command\", \"command\": ")
+              .Append(JsonString(ask)).Append(" } ] } ]\r\n");
+            sb.Append("  }\r\n");
+            sb.Append("}\r\n");
+            return sb.ToString();
+        }
+
+        private static string BuildCliUsage()
+        {
+            string exe = "\"" + AppInfo.ExecutablePath + "\"";
+            var sb = new StringBuilder();
+            sb.Append("# ").Append(L.T("ParaDesk 命令行（分身桌面里也能用）。PowerShell 里要在路径前加 & ，例如 & \"...\\ParaDesk.exe\" --status")).Append("\r\n\r\n");
+            sb.Append("# ").Append(L.T("查询状态；加 --json 输出 JSON。退出码 3 表示 ParaDesk 没在运行")).Append("\r\n");
+            sb.Append(exe).Append(" --status\r\n\r\n");
+            sb.Append("# ").Append(L.T("在主屏提醒你（--level warn / error 用醒目样式，--sound 响一声）")).Append("\r\n");
+            sb.Append(exe).Append(" --notify --title \"Claude Code\" --body \"").Append(L.T("任务完成")).Append("\" --sound\r\n\r\n");
+            sb.Append("# ").Append(L.T("截图，输出文件路径")).Append("\r\n");
+            sb.Append(exe).Append(" --screenshot\r\n\r\n");
+            sb.Append("# ").Append(L.T("开始 / 停止录制")).Append("\r\n");
+            sb.Append(exe).Append(" --record start\r\n");
+            sb.Append(exe).Append(" --record stop\r\n\r\n");
+            sb.Append("# ").Append(L.T("列出全部命令")).Append("\r\n");
+            sb.Append(exe).Append(" --help\r\n");
+            return sb.ToString();
+        }
+
+        private static string JsonString(string s)
+        {
+            var sb = new StringBuilder("\"");
+            foreach (char c in s ?? "")
             {
-                CbFps.IsEnabled = true;
-                if (ok) Info(string.Format(L.T("帧率上限已设为 {0} FPS。{1}。"), fps, L.T(PerformanceSettings.FrameIntervalNote)));
-                else Warn(L.T("设置帧率失败（可能未获得管理员授权）。"));
-                RefreshAll();
-            });
+                switch (c)
+                {
+                    case '\\': sb.Append("\\\\"); break;
+                    case '"': sb.Append("\\\""); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
+                        else sb.Append(c);
+                        break;
+                }
+            }
+            return sb.Append('"').ToString();
+        }
+
+        private bool CopyToClipboard(string text)
+        {
+            try
+            {
+                System.Windows.Clipboard.SetText(text);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("写入剪贴板失败: " + ex.Message);
+                ShowBar(AiBar, global::Wpf.Ui.Controls.InfoBarSeverity.Error,
+                    L.T("复制失败"), L.T("剪贴板正被其它程序占用，请稍后再试。"));
+                return false;
+            }
+        }
+
+        private bool _updateBusy;
+        private string _updateUrl;
+
+        private void OnCheckUpdate(object sender, RoutedEventArgs e)
+        {
+            if (_updateBusy) return;
+            _updateBusy = true;
+            BtnCheckUpdate.IsEnabled = false;
+            BtnCheckUpdate.Content = L.T("正在检查…");
+            BtnOpenDownload.Visibility = Visibility.Collapsed;
+            HideBar(UpdateBar);
+
+            try
+            {
+                UpdateChecker.CheckAsync(delegate(UpdateInfo info, string err)
+                {
+                    try { Dispatcher.BeginInvoke((Action)delegate { OnUpdateChecked(info, err); }); }
+                    catch (Exception ex) { Log.Error("回填更新检查结果失败", ex); }
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error("发起更新检查失败", ex);
+                OnUpdateChecked(null, ex.Message);
+            }
+        }
+
+        private void OnUpdateChecked(UpdateInfo info, string err)
+        {
+            _updateBusy = false;
+            if (_closed) return;
+            BtnCheckUpdate.IsEnabled = true;
+            BtnCheckUpdate.Content = L.T("检查更新");
+
+            if (info == null)
+            {
+                ShowBar(UpdateBar, global::Wpf.Ui.Controls.InfoBarSeverity.Warning,
+                    L.T("检查更新失败"), err ?? L.T("详见日志。"));
+                return;
+            }
+
+            if (info.IsNewer)
+            {
+                _updateUrl = SafeReleaseUrl(info.Url);
+                BtnOpenDownload.Visibility = Visibility.Visible;
+                ShowBar(UpdateBar, global::Wpf.Ui.Controls.InfoBarSeverity.Success,
+                    string.Format(L.T("发现新版本 {0}"), info.LatestVersion),
+                    string.Format(L.T("当前版本 {0}。点「打开下载页」前往 GitHub 下载。"), AppInfo.Version));
+            }
+            else
+            {
+                ShowBar(UpdateBar, global::Wpf.Ui.Controls.InfoBarSeverity.Success,
+                    L.T("已是最新版本"),
+                    string.Format(L.T("当前版本 {0}，GitHub 上最新发布为 {1}。"), AppInfo.Version, info.LatestVersion));
+            }
+        }
+
+        private static string SafeReleaseUrl(string url)
+        {
+            Uri u;
+            if (!string.IsNullOrEmpty(url) && Uri.TryCreate(url, UriKind.Absolute, out u) &&
+                u.Scheme == Uri.UriSchemeHttps &&
+                (string.Equals(u.Host, "github.com", StringComparison.OrdinalIgnoreCase) ||
+                 u.Host.EndsWith(".github.com", StringComparison.OrdinalIgnoreCase)))
+                return u.AbsoluteUri;
+            return UpdateChecker.ReleasesPage;
+        }
+
+        private void OnOpenDownload(object sender, RoutedEventArgs e)
+        {
+            string url = _updateUrl ?? UpdateChecker.ReleasesPage;
+            try { System.Diagnostics.Process.Start(url); }
+            catch (Exception ex)
+            {
+                Log.Error("打开下载页失败", ex);
+                Warn(L.T("无法打开浏览器，请手动访问：") + "\r\n" + url);
+            }
         }
 
         private void OnCredentials(object sender, RoutedEventArgs e)
@@ -1233,7 +2091,12 @@ namespace ParaDesk.Shell
                 v.Owner = this;
                 v.Show();
             }
-            catch (Exception ex) { Log.Error("打开日志查看器失败", ex); }
+            catch (Exception ex)
+            {
+                Log.Error("打开日志查看器失败", ex);
+                Warn(L.T("打开日志查看器失败：") + ex.Message + "\r\n\r\n" +
+                     L.T("日志文件在：") + "\r\n" + Log.Path0);
+            }
         }
 
         private void OnShowWizard(object sender, RoutedEventArgs e)
@@ -1245,13 +2108,19 @@ namespace ParaDesk.Shell
         private void OnOpenLogs(object sender, RoutedEventArgs e)
         {
             try { System.Diagnostics.Process.Start("explorer.exe", "\"" + Log.Dir + "\""); }
-            catch (Exception ex) { Log.Error("打开日志文件夹失败", ex); }
+            catch (Exception ex)
+            {
+                Log.Error("打开日志文件夹失败", ex);
+                Warn(L.T("无法打开文件夹：") + ex.Message + "\r\n\r\n" + Log.Dir);
+            }
         }
 
         // ---------------- 关闭 ----------------
 
         protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
         {
+            if (_startupEditProfile != null) SaveStartupCommand();
+
             // 关窗默认只是收进托盘，进程继续存活
             if (_app.Settings.MinimizeToTray && !_app.IsExiting)
             {
@@ -1260,7 +2129,16 @@ namespace ParaDesk.Shell
                 return;
             }
             if (_ticker != null) { _ticker.Stop(); _ticker = null; }
+            if (_refreshTimer != null) _refreshTimer.Stop();
             base.OnClosing(e);
+        }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            _closed = true;
+            if (_refreshTimer != null) _refreshTimer.Stop();
+            if (_startupSaveTimer != null) _startupSaveTimer.Stop();
+            base.OnClosed(e);
         }
 
         // ---------------- 工具 ----------------
@@ -1275,10 +2153,67 @@ namespace ParaDesk.Shell
             MessageBox.Show(this, msg, AppInfo.ProductName, MessageBoxButton.OK, MessageBoxImage.Warning);
         }
 
-        private static string DescribeMonitor(string device)
+        private static void SetBar(global::Wpf.Ui.Controls.InfoBar bar,
+            global::Wpf.Ui.Controls.InfoBarSeverity severity, string title, string message)
         {
-            var m = MonitorService.Resolve(device);
-            return m == null ? L.T("未知显示器") : m.Display;
+            bar.Severity = severity;
+            bar.Title = title ?? "";
+            bar.Message = message ?? "";
+            ReleaseTemplateText(bar, bar);
+        }
+
+        private static void ReleaseTemplateText(DependencyObject node, DependencyObject owner)
+        {
+            int count;
+            try { count = VisualTreeHelper.GetChildrenCount(node); }
+            catch { return; }
+            for (int i = 0; i < count; i++)
+            {
+                var child = VisualTreeHelper.GetChild(node, i);
+                var tb = child as TextBlock;
+                if (tb != null && ReferenceEquals(tb.TemplatedParent, owner) &&
+                    DependencyPropertyHelper.GetValueSource(tb, TextBlock.TextProperty).BaseValueSource
+                        == BaseValueSource.Local)
+                {
+                    tb.ClearValue(TextBlock.TextProperty);
+                }
+                ReleaseTemplateText(child, owner);
+            }
+        }
+
+        private static void ShowBar(global::Wpf.Ui.Controls.InfoBar bar,
+            global::Wpf.Ui.Controls.InfoBarSeverity severity, string title, string message)
+        {
+            SetBar(bar, severity, title, message);
+            bar.Visibility = Visibility.Visible;
+        }
+
+        private static void HideBar(global::Wpf.Ui.Controls.InfoBar bar)
+        {
+            bar.Visibility = Visibility.Collapsed;
+        }
+
+        private sealed class ChoiceItem
+        {
+            public readonly int Value;
+            private readonly string _text;
+            public ChoiceItem(int value, string text) { Value = value; _text = text; }
+            public override string ToString() { return _text; }
+        }
+
+        private static int IndexOfChoice(ComboBox cb, int value)
+        {
+            for (int i = 0; i < cb.Items.Count; i++)
+            {
+                var c = cb.Items[i] as ChoiceItem;
+                if (c != null && c.Value == value) return i;
+            }
+            return -1;
+        }
+
+        private static void SelectChoice(ComboBox cb, int value)
+        {
+            cb.SelectedIndex = IndexOfChoice(cb, value);
         }
 
         /// <summary>
@@ -1502,6 +2437,49 @@ namespace ParaDesk.Shell
             private readonly string _text;
             public FpsItem(int fps, string text) { Fps = fps; _text = text; }
             public override string ToString() { return _text; }
+        }
+
+        /// <summary>
+        /// 只更新「应用」按钮的可用性，**不写注册表**。
+        ///
+        /// 这一项是要提权的整机改动。挂在 SelectionChanged 上时，
+        /// 用键盘在下拉里划过几档就会连着弹几次 UAC、连着写几次注册表——
+        /// 而且中途每一次都真的生效了。改成显式点「应用」，一次意图对应一次提权。
+        /// </summary>
+        private void OnFpsSelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_loading) return;
+            UpdateApplyFpsState();
+        }
+
+        private void UpdateApplyFpsState()
+        {
+            var item = CbFps.SelectedItem as FpsItem;
+            if (item == null) { BtnApplyFps.IsEnabled = false; return; }
+
+            // 比较**将要写入的注册表值**而不是帧率本身：
+            // FpsToInterval 与 FrameIntervalToFps 不互逆（60 → 17ms → 读回 59），
+            // 按帧率比会让"其实没变"显示成"可以应用"。
+            int want = PerformanceSettings.FpsToInterval(item.Fps);
+            int? have = PerformanceSettings.GetFrameInterval();
+            BtnApplyFps.IsEnabled = want != (have.HasValue ? have.Value : 0);
+        }
+
+        private void OnApplyFps(object sender, RoutedEventArgs e)
+        {
+            var item = CbFps.SelectedItem as FpsItem;
+            if (item == null) return;
+            int fps = item.Fps;
+
+            CbFps.IsEnabled = false;
+            BtnApplyFps.IsEnabled = false;
+            _app.RunSetupFps(fps, delegate(bool ok)
+            {
+                CbFps.IsEnabled = true;
+                if (ok) Info(string.Format(L.T("帧率上限已设为 {0} FPS。{1}。"), fps, L.T(PerformanceSettings.FrameIntervalNote)));
+                else Warn(L.T("设置帧率失败（可能未获得管理员授权）。"));
+                RefreshAll();
+            });
         }
 
         private void ApplyResolutionChoice(DesktopProfile p, int index)

@@ -42,9 +42,7 @@ namespace ParaDesk.Core
             {
                 Name = name,
                 ExePath = path,
-                ProfileDir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    AppInfo.ProductName, profileName),
+                ProfileDir = Path.Combine(AppInfo.DataDir, profileName),
             });
         }
 

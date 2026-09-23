@@ -445,8 +445,6 @@ namespace ParaDesk.Core
                 Add("配置完成后需重启电脑一次才会就绪", "Ready after one restart following setup");
                 Add("Windows 家庭版不含子会话功能，需要专业版及以上。分身桌面与沙盒桌面都用不了，录制和截图仍可正常使用。",
                     "Windows Home has no child sessions — Pro or higher is required. Neither the parallel desktop nor the sandbox desktop is available; recording and screenshots still work.");
-                Add("系统 {0} (build {1})　子会话 {2}　监听器 {3}",
-                    "{0} (build {1})　Child sessions {2}　Listener {3}");
 
                 // 沙盒
                 Add("Windows 家庭版不含沙盒功能，需专业版及以上。",

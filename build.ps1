@@ -4,7 +4,8 @@ param(
     [switch]$Release,
     [switch]$Run,
     [switch]$Probe,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$Arm64
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,13 +13,15 @@ $ErrorActionPreference = 'Stop'
 
 $conf = if ($Release) { 'Release' } else { 'Debug' }
 $dotnet = Resolve-Dotnet
-$outDir = Get-ParaDeskOutputDir -Configuration $conf
-$exe = Get-ParaDeskExe -Configuration $conf
+$platform = if ($Arm64) { 'ARM64' } else { 'AnyCPU' }
+$outDir = Get-ParaDeskOutputDir -Configuration $conf -Platform $platform
+$exe = Get-ParaDeskExe -Configuration $conf -Platform $platform
 
 Stop-ParaDeskIfRunning -OutputDir $outDir -Force:$Force
 
-Write-Host "构建 $conf ..." -ForegroundColor Cyan
-& $dotnet build $ParaDeskProject -c $conf -v minimal -nologo
+Write-Host "构建 $conf ($platform) ..." -ForegroundColor Cyan
+$platformArgs = @(Get-ParaDeskBuildArgs -Platform $platform)
+& $dotnet build $ParaDeskProject -c $conf -v minimal -nologo @platformArgs
 if ($LASTEXITCODE -ne 0) { throw "构建失败 (exit $LASTEXITCODE)" }
 if (-not (Test-Path -LiteralPath $exe)) { throw "构建成功但找不到产物: $exe" }
 

@@ -7,7 +7,8 @@ param(
     [switch]$IncludeInteractive,
     [switch]$Release,
     [string]$Exe = '',
-    [switch]$Force
+    [switch]$Force,
+    [switch]$Arm64
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,9 +21,10 @@ if ($Exe) {
 }
 else {
     $conf = if ($Release) { 'Release' } else { 'Debug' }
-    $Exe = Get-ParaDeskExe -Configuration $conf
+    $platform = if ($Arm64) { 'ARM64' } else { 'AnyCPU' }
+    $Exe = Get-ParaDeskExe -Configuration $conf -Platform $platform
     if (-not (Test-Path -LiteralPath $Exe)) {
-        $buildHint = if ($Release) { '.\build.ps1 -Release' } else { '.\build.ps1' }
+        $buildHint = '.\build.ps1' + $(if ($Release) { ' -Release' } else { '' }) + $(if ($Arm64) { ' -Arm64' } else { '' })
         throw "找不到程序 $Exe ，请先运行 $buildHint"
     }
 }

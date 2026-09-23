@@ -75,7 +75,12 @@ chinese.AppStillRunning=ParaDesk 仍在运行（可能在分身桌面里：从�
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
+#ifdef SourceDirArm64
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "LICENSE.txt"; Flags: ignoreversion recursesubdirs createallsubdirs; Check: not UseArm64Build
+Source: "{#SourceDirArm64}\*"; DestDir: "{app}"; Excludes: "LICENSE.txt"; Flags: ignoreversion recursesubdirs createallsubdirs; Check: UseArm64Build
+#else
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "LICENSE.txt"; Flags: ignoreversion recursesubdirs createallsubdirs
+#endif
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
 [Icons]
@@ -94,6 +99,17 @@ Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchApp}"; Flags: nowait postin
 const
   RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
   StartupApprovedRunKey = 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run';
+
+{ Arm64 版需要 .NET Framework 4.8.1（Release >= 533320）；没有的话装 AnyCPU 版，由系统以 x64 模拟运行。 }
+function UseArm64Build(): Boolean;
+var
+  Release: Cardinal;
+begin
+  Result := False;
+  if not IsArm64 then Exit;
+  if RegQueryDWordValue(HKLM, 'SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full', 'Release', Release) then
+    Result := Release >= 533320;
+end;
 
 { 家庭版装了也跑不起来，装之前如实告知，但不强行拦——
   用户可能只是想先装上、之后升级系统版本。 }

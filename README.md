@@ -109,6 +109,8 @@ Consequences worth knowing:
 - .NET Framework 4.8 (ships with Windows 10 1903+)
 - One administrator approval on first use; everyday use needs no elevation
 
+**Windows on Arm.** There is a native Arm64 build (`ParaDesk-<version>-arm64.zip`; the installer picks it automatically on Arm devices). It needs Windows 11 on Arm with .NET Framework 4.8.1, which ships with Windows 11 22H2 and later. The regular build also works on Arm devices, but Windows runs it under x64 emulation. *About* and `--probe` show which one is running.
+
 ## Getting started
 
 ```powershell
@@ -228,7 +230,8 @@ In cmd use `start "" /wait "C:\path\to\ParaDesk.exe" --status` and then `%ERRORL
 .\build.ps1 -Release     # Release
 .\build.ps1 -Run         # build, then start it
 .\build.ps1 -Probe       # build, then print the environment probe
-.\publish.ps1            # portable zip + installer into dist\
+.\build.ps1 -Arm64       # native Arm64 build (output in bin\ARM64\)
+.\publish.ps1            # portable zips (AnyCPU and arm64) + installer into dist\
 ```
 
 Only the **.NET SDK** is required — `dotnet build` uses the SDK's MSBuild. Visual Studio and Build Tools are *not* needed: the net48 reference assemblies are a standalone component, and this project does not use `COMReference` interop generation.
@@ -237,8 +240,9 @@ Only the **.NET SDK** is required — `dotnet build` uses the SDK's MSBuild. Vis
 - **The parallel desktop's helper** (`ParaDesk.exe --childagent`) runs from whichever copy of ParaDesk you started last and keeps running until the parallel desktop signs out. Exiting ParaDesk from the tray does not stop it, so the scripts list it separately. Either sign out of the parallel desktop (sign out inside it, or *Close desktop*; this ends every program in it) or use `-Force`. After `-Force` stops the helper, *Keep awake* and the error-dialog guard stay off until the parallel desktop next signs in.
 - **NuGet cache**: packages go to NuGet's default cache. Setting `NUGET_PACKAGES` to put them elsewhere is optional.
 - **`publish.ps1`** takes the version from `<Version>` in the csproj (`-Version` overrides it). It must be three numbers such as `1.2.3` — that is what the app reports and compares when it checks for updates, so four-part versions and `-beta` suffixes are refused. It packages every `.exe` / `.dll` / `.config` of the Release output and warns about anything it leaves out, writes `README.txt` and `使用说明.txt`, and prints SHA-256 checksums. `-SelfTest` runs `selftest.ps1 -Quick` against the Release build first; `-NoInstaller` skips the installer.
+- **Arm64**: `publish.ps1` builds both flavours by default (`-Platform AnyCPU` or `-Platform ARM64` builds just one) and produces `ParaDesk-<version>.zip` and `ParaDesk-<version>-arm64.zip`. The installer contains both and installs the Arm64 build on Arm devices that have .NET Framework 4.8.1. `selftest.ps1 -Release -Arm64` tests the Arm64 build; it only runs on an Arm device.
 - **The installer** needs Inno Setup 6.3 or later (`-IsccPath` if it is not in a standard location). If that Inno Setup has `Languages\ChineseSimplified.isl` — an unofficial translation, not part of the standard install — the installer gets a Chinese UI as well; otherwise it is English-only and `publish.ps1` tells you where to put the file.
-- **CI** (`.github/workflows/build.yml`) builds Release on every push and pull request to `main`, runs `--i18ntest`, `--logictest`, `--probe --json` and `--help`, and uploads the build output.
+- **CI** (`.github/workflows/build.yml`) builds Release (AnyCPU and Arm64) on every push and pull request to `main`, runs `--i18ntest`, `--logictest`, `--probe --json` and `--help`, and uploads both build outputs. A second job runs the same checks natively on a Windows 11 Arm runner and fails if the Arm64 build is not running natively.
 
 ## Self-tests
 
@@ -415,6 +419,8 @@ WTSEnableChildSessions(true)        ← 一次性，需要管理员
 - .NET Framework 4.8（Windows 10 1903+ 自带）
 - 首次使用需要一次管理员授权，日常使用无需提权
 
+**Arm 设备（Windows on Arm）**：有原生 Arm64 版本（`ParaDesk-<版本>-arm64.zip`；安装包在 Arm 设备上会自动装它），需要 Arm 版 Windows 11 与 .NET Framework 4.8.1（Windows 11 22H2 起系统自带）。普通版本在 Arm 设备上也能用，但由系统以 x64 模拟运行。「关于」页和 `--probe` 会显示当前运行的是哪一种。
+
 ## 上手
 
 ```powershell
@@ -528,7 +534,8 @@ cmd 里用 `start "" /wait "C:\path\to\ParaDesk.exe" --status`，再看 `%ERRORL
 .\build.ps1 -Release     # Release
 .\build.ps1 -Run         # 构建后运行
 .\build.ps1 -Probe       # 构建后打印环境自检
-.\publish.ps1            # 打包绿色版 zip 与安装包到 dist\
+.\build.ps1 -Arm64       # 原生 Arm64 构建（产物在 bin\ARM64\）
+.\publish.ps1            # 打包绿色版 zip（AnyCPU 与 arm64 各一份）与安装包到 dist\
 .\selftest.ps1           # 自检（-Quick 跳过录制类；-Release 测 Release 产物；-Exe <路径> 测任意 ParaDesk.exe）
 ```
 
@@ -538,8 +545,9 @@ cmd 里用 `start "" /wait "C:\path\to\ParaDesk.exe" --status`，再看 `%ERRORL
 - **分身桌面里的小守护**（`ParaDesk.exe --childagent`）从你最近运行的那份 ParaDesk 启动，一直运行到分身桌面注销。从托盘退出 ParaDesk 停不掉它，所以脚本会单独列出它。要么注销分身桌面（在分身桌面里注销，或点「关闭桌面」；会结束里面的所有程序），要么加 `-Force`。`-Force` 结束守护后，「保持唤醒」和错误框拦截要到分身桌面下次登录才恢复。
 - **NuGet 缓存**用 NuGet 的默认位置；想放到别处，设置环境变量 `NUGET_PACKAGES` 即可（可选）。
 - **`publish.ps1`** 的版本号取 csproj 的 `<Version>`（`-Version` 可覆盖），必须是 `1.2.3` 这样的三段数字 —— 程序报告的、检查更新时比较的就是它，四段式和 `-beta` 这类后缀会被拒绝；打包 Release 输出目录里全部 `.exe` / `.dll` / `.config`，漏掉的文件会告警；生成 `README.txt` 与 `使用说明.txt`；输出 SHA-256 校验值。`-SelfTest` 先对 Release 产物跑 `selftest.ps1 -Quick`，`-NoInstaller` 只出 zip。
+- **Arm64**：`publish.ps1` 默认两种都构建（`-Platform AnyCPU` 或 `-Platform ARM64` 只构建一种），产出 `ParaDesk-<版本>.zip` 与 `ParaDesk-<版本>-arm64.zip`；安装包两种都带，在装有 .NET Framework 4.8.1 的 Arm 设备上装 Arm64 版。`selftest.ps1 -Release -Arm64` 测 Arm64 产物，只能在 Arm 设备上运行。
 - **安装包**需要 Inno Setup 6.3 或更高版本（不在标准位置时用 `-IsccPath` 指定）。那份 Inno Setup 里有 `Languages\ChineseSimplified.isl`（非官方翻译，标准安装不含）时，安装包带中文界面；没有就只打英文界面，`publish.ps1` 会提示把文件放到哪里。
-- **CI**（`.github/workflows/build.yml`）在每次推送到 `main` 和每个指向 `main` 的 PR 上构建 Release，运行 `--i18ntest`、`--logictest`、`--probe --json`、`--help`，并上传构建产物。
+- **CI**（`.github/workflows/build.yml`）在每次推送到 `main` 和每个指向 `main` 的 PR 上构建 Release（AnyCPU 与 Arm64），运行 `--i18ntest`、`--logictest`、`--probe --json`、`--help`，并上传两份构建产物；另有一个任务在 Windows 11 Arm 机器上原生跑同样的检查，Arm64 版没有原生运行时判为失败。
 
 | 命令 | 检查内容 | 退出码 |
 |---|---|---|

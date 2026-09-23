@@ -6,7 +6,9 @@ param(
     [switch]$NoInstaller,
     [string]$IsccPath = '',
     [switch]$SelfTest,
-    [switch]$Force
+    [switch]$Force,
+    [ValidateSet('All', 'AnyCPU', 'ARM64')]
+    [string]$Platform = 'All'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,77 +38,9 @@ if ($ver -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
 }
 
 $dotnet = Resolve-Dotnet
-$binDir = Get-ParaDeskOutputDir -Configuration Release
-$exe = Get-ParaDeskExe -Configuration Release
-$stage = Join-Path $outRoot "ParaDesk-$ver"
-
-Stop-ParaDeskIfRunning -OutputDir $binDir -Force:$Force
-Stop-ParaDeskIfRunning -OutputDir $stage -Force:$Force
-
-Write-Host "构建 Release $ver ..." -ForegroundColor Cyan
-$buildArgs = @($ParaDeskProject, '-c', 'Release', '-v', 'minimal', '-nologo', '--no-incremental', "-p:Version=$ver")
-& $dotnet build @buildArgs
-if ($LASTEXITCODE -ne 0) { throw "构建失败 ($LASTEXITCODE)" }
-if (-not (Test-Path -LiteralPath $exe)) { throw "找不到产物: $exe" }
-
-$asmVersion = [Reflection.AssemblyName]::GetAssemblyName($exe).Version
-$asmVer = if ($asmVersion) { $asmVersion.ToString(3) } else { '' }
-if ($asmVer -ne $ver) {
-    throw "产物的程序集版本是 '$asmVer'，与要打包的 '$ver' 不一致（版本号多半没有传给构建），已停止打包。"
-}
-Write-Host "版本: $ver" -ForegroundColor Green
-
-if ($SelfTest) {
-    Write-Host ''
-    Write-Host '打包前自检（selftest -Quick，Release 产物）...' -ForegroundColor Cyan
-    & (Join-Path $ParaDeskRoot 'selftest.ps1') -Exe $exe -Quick
-    if ($LASTEXITCODE -ne 0) { throw "自检未通过 (exit $LASTEXITCODE)，已停止打包。" }
-}
-
-if (Test-Path -LiteralPath $stage) {
-    try { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction Stop }
-    catch {
-        throw (("删除上一次的发布目录失败，里面有文件被占用（资源管理器预览窗格、杀毒软件、当前目录在里面的终端等）：{0}`n" +
-                "  关闭占用它的程序后重试。原始错误：{1}") -f $stage, $_.Exception.Message)
-    }
-}
-New-Item -ItemType Directory -Force -Path $stage | Out-Null
-
-$includeExt = @('.exe', '.dll', '.config')
-$excludeExt = @('.pdb', '.xml')
-$binFull = (Resolve-Path -LiteralPath $binDir).ProviderPath.TrimEnd('\')
-$packaged = New-Object System.Collections.Generic.List[string]
-$excluded = New-Object System.Collections.Generic.List[string]
-$notPackaged = New-Object System.Collections.Generic.List[string]
-
-foreach ($f in @(Get-ChildItem -LiteralPath $binFull -Recurse -File)) {
-    $rel = $f.FullName.Substring($binFull.Length + 1)
-    $ext = $f.Extension.ToLowerInvariant()
-    if ($includeExt -contains $ext) {
-        $dest = Join-Path $stage $rel
-        $destDir = Split-Path -Parent $dest
-        if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
-        Copy-Item -LiteralPath $f.FullName -Destination $dest
-        $packaged.Add($rel)
-    }
-    elseif ($excludeExt -contains $ext) { $excluded.Add($rel) }
-    else { $notPackaged.Add($rel) }
-}
-
-foreach ($must in @('ParaDesk.exe', 'Wpf.Ui.dll')) {
-    if ($packaged -notcontains $must) { throw "输出目录里缺少 $must，无法打包: $binFull" }
-}
-if ($packaged -notcontains 'ParaDesk.exe.config') { Write-Warning '输出目录里没有 ParaDesk.exe.config（绑定重定向），发布包可能无法加载 WinRT 组件。' }
-
-Write-Host ("打包文件 {0} 个：{1}" -f $packaged.Count, ($packaged -join ', ')) -ForegroundColor DarkGray
-if ($excluded.Count -gt 0) {
-    Write-Host ("按规则不打包：{0}" -f ($excluded -join ', ')) -ForegroundColor DarkGray
-}
-if ($notPackaged.Count -gt 0) {
-    Write-Warning ("输出目录里有、但没有打包的文件：{0}`n  如果程序运行需要它们，请在 publish.ps1 的 includeExt 里补上扩展名。" -f ($notPackaged -join ', '))
-}
-
-Copy-Item -LiteralPath (Join-Path $ParaDeskRoot 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
+$osArch = if ((Get-CimInstance Win32_Processor | Select-Object -First 1).Architecture -eq 12) { 'ARM64' } else { 'x64' }
+$flavors = if ($Platform -eq 'All') { @('AnyCPU', 'ARM64') } else { @($Platform) }
+$stages = @{}
 
 function Get-DefaultHotkeys {
     $fallback = [ordered]@{
@@ -153,7 +87,113 @@ $hkDesktop = $hk['toggleDesktop'].PadRight(12)
 $hkViewOnly = $hk['toggleViewOnly'].PadRight(12)
 $hkRecording = $hk['toggleRecording'].PadRight(12)
 
-$readmeEn = @"
+function Write-DocFile([string]$Path, [string]$Text) {
+    $crlf = ($Text.TrimEnd() -replace "`r?`n", "`r`n") + "`r`n"
+    [IO.File]::WriteAllText($Path, $crlf, (New-Object Text.UTF8Encoding($true)))
+}
+
+$hk = Get-DefaultHotkeys
+$hkDesktop = $hk['toggleDesktop'].PadRight(12)
+$hkViewOnly = $hk['toggleViewOnly'].PadRight(12)
+$hkRecording = $hk['toggleRecording'].PadRight(12)
+
+$req = @{
+    AnyCPU = @{
+        En = "  - Windows 10 1903 or later / Windows 11`n  - Pro, Enterprise or Education (Home has no child-session support)`n  - .NET Framework 4.8 (ships with Windows 10 1903 and later)`n  - On Windows on Arm this build runs under x64 emulation; use the -arm64 package to run natively"
+        Zh = "  - Windows 10 1903 或更高 / Windows 11`n  - 专业版、企业版或教育版（家庭版不含子会话功能）`n  - .NET Framework 4.8（Win10 1903+ 系统自带）`n  - 在 Arm 设备上本版本以 x64 模拟运行；请改用 -arm64 包以原生运行"
+    }
+    ARM64 = @{
+        En = "  - Windows 11 on Arm (Arm64)`n  - Pro, Enterprise or Education (Home has no child-session support)`n  - .NET Framework 4.8.1 (ships with Windows 11 22H2 and later)"
+        Zh = "  - Arm 版 Windows 11（Arm64）`n  - 专业版、企业版或教育版（家庭版不含子会话功能）`n  - .NET Framework 4.8.1（Windows 11 22H2 起系统自带）"
+    }
+}
+
+foreach ($flavor in $flavors) {
+    $suffix = if ($flavor -eq 'ARM64') { '-arm64' } else { '' }
+    $binDir = Get-ParaDeskOutputDir -Configuration Release -Platform $flavor
+    $exe = Get-ParaDeskExe -Configuration Release -Platform $flavor
+    $stage = Join-Path $outRoot "ParaDesk-$ver$suffix"
+
+    Stop-ParaDeskIfRunning -OutputDir $binDir -Force:$Force
+    Stop-ParaDeskIfRunning -OutputDir $stage -Force:$Force
+
+    Write-Host "构建 Release $ver ($flavor) ..." -ForegroundColor Cyan
+    $buildArgs = @($ParaDeskProject, '-c', 'Release', '-v', 'minimal', '-nologo', '--no-incremental', "-p:Version=$ver")
+    $buildArgs += @(Get-ParaDeskBuildArgs -Platform $flavor)
+    & $dotnet build @buildArgs
+    if ($LASTEXITCODE -ne 0) { throw "构建失败 ($LASTEXITCODE)" }
+    if (-not (Test-Path -LiteralPath $exe)) { throw "找不到产物: $exe" }
+
+    $asmVersion = [Reflection.AssemblyName]::GetAssemblyName($exe).Version
+    $asmVer = if ($asmVersion) { $asmVersion.ToString(3) } else { '' }
+    if ($asmVer -ne $ver) {
+        throw "产物的程序集版本是 '$asmVer'，与要打包的 '$ver' 不一致（版本号多半没有传给构建），已停止打包。"
+    }
+    Write-Host "版本: $ver" -ForegroundColor Green
+
+    if ($SelfTest) {
+        Write-Host ''
+        if ($flavor -eq 'ARM64' -and $osArch -ne 'ARM64') {
+            Write-Host '这台机器不是 Arm64，跳过 ARM64 产物的自检。' -ForegroundColor DarkGray
+        }
+        else {
+            Write-Host "打包前自检（selftest -Quick，Release $flavor 产物）..." -ForegroundColor Cyan
+            & (Join-Path $ParaDeskRoot 'selftest.ps1') -Exe $exe -Quick
+            if ($LASTEXITCODE -ne 0) { throw "自检未通过 (exit $LASTEXITCODE)，已停止打包。" }
+        }
+    }
+
+    if (Test-Path -LiteralPath $stage) {
+        try { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction Stop }
+        catch {
+            throw (("删除上一次的发布目录失败，里面有文件被占用（资源管理器预览窗格、杀毒软件、当前目录在里面的终端等）：{0}`n" +
+                    "  关闭占用它的程序后重试。原始错误：{1}") -f $stage, $_.Exception.Message)
+        }
+    }
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+    $includeExt = @('.exe', '.dll', '.config')
+    $excludeExt = @('.pdb', '.xml')
+    $binFull = (Resolve-Path -LiteralPath $binDir).ProviderPath.TrimEnd('\')
+    $packaged = New-Object System.Collections.Generic.List[string]
+    $excluded = New-Object System.Collections.Generic.List[string]
+    $notPackaged = New-Object System.Collections.Generic.List[string]
+
+    foreach ($f in @(Get-ChildItem -LiteralPath $binFull -Recurse -File)) {
+        $rel = $f.FullName.Substring($binFull.Length + 1)
+        $ext = $f.Extension.ToLowerInvariant()
+        if ($includeExt -contains $ext) {
+            $dest = Join-Path $stage $rel
+            $destDir = Split-Path -Parent $dest
+            if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
+            Copy-Item -LiteralPath $f.FullName -Destination $dest
+            $packaged.Add($rel)
+        }
+        elseif ($excludeExt -contains $ext) { $excluded.Add($rel) }
+        else { $notPackaged.Add($rel) }
+    }
+
+    foreach ($must in @('ParaDesk.exe', 'Wpf.Ui.dll')) {
+        if ($packaged -notcontains $must) { throw "输出目录里缺少 $must，无法打包: $binFull" }
+    }
+    if ($packaged -notcontains 'ParaDesk.exe.config') { Write-Warning '输出目录里没有 ParaDesk.exe.config（绑定重定向），发布包可能无法加载 WinRT 组件。' }
+
+    Write-Host ("打包文件 {0} 个：{1}" -f $packaged.Count, ($packaged -join ', ')) -ForegroundColor DarkGray
+    if ($excluded.Count -gt 0) {
+        Write-Host ("按规则不打包：{0}" -f ($excluded -join ', ')) -ForegroundColor DarkGray
+    }
+    if ($notPackaged.Count -gt 0) {
+        Write-Warning ("输出目录里有、但没有打包的文件：{0}`n  如果程序运行需要它们，请在 publish.ps1 的 includeExt 里补上扩展名。" -f ($notPackaged -join ', '))
+    }
+
+    Copy-Item -LiteralPath (Join-Path $ParaDeskRoot 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
+
+    Write-DocFile -Path (Join-Path $stage 'README.txt') -Text $readmeEn
+    Write-DocFile -Path (Join-Path $stage '使用说明.txt') -Text $readmeZh
+
+    $reqEn = $req[$flavor].En
+    $reqZh = $req[$flavor].Zh
+    $readmeEn = @"
 ParaDesk $ver
 
 A second Windows desktop on your spare monitor, with its own mouse and
@@ -161,9 +201,7 @@ keyboard, sharing your account and all your files. Let an AI coding agent
 work over there while you keep using your own desktop.
 
 Requirements
-  - Windows 10 1903 or later / Windows 11
-  - Pro, Enterprise or Education (Home has no child-session support)
-  - .NET Framework 4.8 (ships with Windows 10 1903 and later)
+$reqEn
 
 First use
   1. Run ParaDesk.exe and press "Start desktop". The one-time system
@@ -205,7 +243,7 @@ modification and redistribution are allowed; keep the copyright and
 licence notice with copies.
 "@
 
-$readmeZh = @"
+    $readmeZh = @"
 ParaDesk 分身桌面  $ver
 
 在闲置的显示器上开出第二个 Windows 桌面，拥有独立的鼠标键盘，
@@ -213,9 +251,7 @@ ParaDesk 分身桌面  $ver
 适合让 AI 编程 agent 在那边干活，你在这边照常用电脑。
 
 运行要求
-  - Windows 10 1903 或更高 / Windows 11
-  - 专业版、企业版或教育版（家庭版不含子会话功能）
-  - .NET Framework 4.8（Win10 1903+ 系统自带）
+$reqZh
 
 首次使用
   1. 运行 ParaDesk.exe，点“启动桌面”，按提示完成一次性系统配置（需要一次管理员授权）
@@ -254,38 +290,40 @@ ParaDesk 分身桌面  $ver
       复制或分发时请保留版权及许可声明。
 "@
 
-Write-DocFile -Path (Join-Path $stage 'README.txt') -Text $readmeEn
-Write-DocFile -Path (Join-Path $stage '使用说明.txt') -Text $readmeZh
+    Write-DocFile -Path (Join-Path $stage 'README.txt') -Text $readmeEn
+    Write-DocFile -Path (Join-Path $stage '使用说明.txt') -Text $readmeZh
 
-$zip = Join-Path $outRoot "ParaDesk-$ver.zip"
-if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-Add-Type -AssemblyName System.IO.Compression
-Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = Join-Path $outRoot "ParaDesk-$ver$suffix.zip"
+    if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-$stageFull = (Resolve-Path -LiteralPath $stage).ProviderPath.TrimEnd('\')
-$zipStream = [IO.File]::Open($zip, [IO.FileMode]::CreateNew)
-try {
-    $archive = New-Object IO.Compression.ZipArchive($zipStream, [IO.Compression.ZipArchiveMode]::Create)
+    $stageFull = (Resolve-Path -LiteralPath $stage).ProviderPath.TrimEnd('\')
+    $zipStream = [IO.File]::Open($zip, [IO.FileMode]::CreateNew)
     try {
-        foreach ($f in @(Get-ChildItem -LiteralPath $stageFull -Recurse -File)) {
-            $entryName = $f.FullName.Substring($stageFull.Length + 1).Replace('\', '/')
-            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-                $archive, $f.FullName, $entryName, [IO.Compression.CompressionLevel]::Optimal)
+        $archive = New-Object IO.Compression.ZipArchive($zipStream, [IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($f in @(Get-ChildItem -LiteralPath $stageFull -Recurse -File)) {
+                $entryName = $f.FullName.Substring($stageFull.Length + 1).Replace('\', '/')
+                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $archive, $f.FullName, $entryName, [IO.Compression.CompressionLevel]::Optimal)
+            }
         }
+        finally { $archive.Dispose() }
     }
-    finally { $archive.Dispose() }
+    finally { $zipStream.Dispose() }
+
+    $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+    Set-Content -LiteralPath (Join-Path $outRoot "ParaDesk-$ver$suffix.sha256") -Value "$hash  ParaDesk-$ver$suffix.zip" -Encoding ASCII
+
+    Write-Host ''
+    Write-Host "输出目录 : $stage" -ForegroundColor Green
+    Write-Host "压缩包   : $zip" -ForegroundColor Green
+    Write-Host ("大小     : {0:N2} MB" -f ((Get-Item -LiteralPath $zip).Length / 1MB))
+    Write-Host "SHA256   : $hash"
+
+    $stages[$flavor] = $stage
 }
-finally { $zipStream.Dispose() }
-
-# 校验值，方便分发时核对完整性
-$hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
-Set-Content -LiteralPath (Join-Path $outRoot "ParaDesk-$ver.sha256") -Value "$hash  ParaDesk-$ver.zip" -Encoding ASCII
-
-Write-Host ''
-Write-Host "输出目录 : $stage" -ForegroundColor Green
-Write-Host "压缩包   : $zip" -ForegroundColor Green
-Write-Host ("大小     : {0:N2} MB" -f ((Get-Item -LiteralPath $zip).Length / 1MB))
-Write-Host "SHA256   : $hash"
 
 # ---------------- 安装包 ----------------
 
@@ -316,6 +354,10 @@ if ($NoInstaller) {
     Write-Host ''
     Write-Host '已跳过安装包（-NoInstaller）。' -ForegroundColor DarkGray
 }
+elseif (-not $stages.ContainsKey('AnyCPU')) {
+    Write-Host ''
+    Write-Host '只构建了 ARM64，跳过安装包（安装包以 AnyCPU 版本为主体）。' -ForegroundColor DarkGray
+}
 else {
     $iscc = Find-ISCC $IsccPath
     if (-not $iscc) {
@@ -327,7 +369,11 @@ else {
         Write-Host ''
         Write-Host "构建安装包 ... ($iscc)" -ForegroundColor Cyan
         $iss = Join-Path $ParaDeskRoot 'installer\ParaDesk.iss'
-        $isccArgs = @("/DAppVersion=$ver", "/DSourceDir=$stage", "/DOutputDir=$outRoot")
+        $isccArgs = @("/DAppVersion=$ver", "/DSourceDir=$($stages['AnyCPU'])", "/DOutputDir=$outRoot")
+        if ($stages.ContainsKey('ARM64')) {
+            $isccArgs += "/DSourceDirArm64=$($stages['ARM64'])"
+            Write-Host '  安装包内含原生 ARM64 版本，在 Arm 设备上自动安装它' -ForegroundColor DarkGray
+        }
 
         $isccDir = Split-Path -Parent $iscc
         $zhIsl = Join-Path $isccDir 'Languages\ChineseSimplified.isl'

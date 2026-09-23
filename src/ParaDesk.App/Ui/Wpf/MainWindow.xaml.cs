@@ -262,10 +262,14 @@ namespace ParaDesk.Shell
                         : sbReason;
 
                 AboutEnv.Text = string.Format(
-                    L.T("系统 {0} (build {1})　子会话 {2}　监听器 {3}"),
+                    L.T("系统 {0} (build {1})　子会话 {2}　监听器 {3}　架构 {4}"),
                     env.EditionId, env.BuildNumber,
                     env.ChildSessionsEnabled ? L.T("已启用") : L.T("未启用"),
-                    env.RdpListenerEnabled ? L.T("已启用") : L.T("未启用"));
+                    env.RdpListenerEnabled ? L.T("已启用") : L.T("未启用"),
+                    PlatformInfo.ShouldUseArm64Build
+                        ? string.Format(L.T("{0}（在 {1} 上模拟运行，建议改用 arm64 版）"),
+                                        PlatformInfo.ProcessArchitecture, PlatformInfo.OsArchitecture)
+                        : PlatformInfo.ProcessArchitecture);
             }
             finally { _loading = false; }
 

@@ -109,6 +109,7 @@ namespace ParaDesk
             AppDomain.CurrentDomain.UnhandledException += OnDomainUnhandledException;
 
             Log.Info("=== " + AppInfo.Title + " v" + AppInfo.Version + " 启动 ===");
+            Log.Info("运行架构: " + PlatformInfo.Describe());
 
             AppSettings settings = LoadSettingsForUi();
 

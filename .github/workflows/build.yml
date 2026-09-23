@@ -21,40 +21,16 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
-      - name: Build (Release)
+      - name: Build (Release, AnyCPU)
         run: dotnet build src/ParaDesk.App/ParaDesk.App.csproj -c Release -nologo
 
-      - name: Self-tests
+      - name: Build (Release, ARM64)
+        run: dotnet build src/ParaDesk.App/ParaDesk.App.csproj -c Release -nologo -p:Platform=ARM64
+
+      - name: Self-tests (AnyCPU)
         shell: pwsh
         timeout-minutes: 10
-        run: |
-          $exe = (Resolve-Path 'src/ParaDesk.App/bin/Release/net48/ParaDesk.exe').Path
-          $out = Join-Path $env:RUNNER_TEMP 'paradesk-stdout.txt'
-          $err = Join-Path $env:RUNNER_TEMP 'paradesk-stderr.txt'
-
-          function Invoke-Check([string]$Name, [string[]]$Arguments, [int[]]$OkCodes) {
-            $p = Start-Process -FilePath $exe -ArgumentList $Arguments -Wait -PassThru -NoNewWindow `
-                   -RedirectStandardOutput $out -RedirectStandardError $err
-            $code = $p.ExitCode
-            Write-Host "::group::$Name (exit $code)"
-            if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out -Encoding utf8 | Write-Host }
-            if (Test-Path -LiteralPath $err) { Get-Content -LiteralPath $err -Encoding utf8 | Write-Host }
-            Write-Host '::endgroup::'
-            if ($OkCodes -contains $code) {
-              Write-Host "PASS  $Name (exit $code)"
-              return $true
-            }
-            Write-Host "::error::$Name exited with $code (expected $($OkCodes -join ' or '))"
-            return $false
-          }
-
-          $failed = 0
-          if (-not (Invoke-Check 'i18n dictionary (--i18ntest)' @('--i18ntest') @(0))) { $failed++ }
-          if (-not (Invoke-Check 'pure logic (--logictest)' @('--logictest') @(0))) { $failed++ }
-          if (-not (Invoke-Check 'environment probe (--probe --json)' @('--probe', '--json') @(0, 2))) { $failed++ }
-          if (-not (Invoke-Check 'help (--help)' @('--help') @(0))) { $failed++ }
-
-          if ($failed -gt 0) { throw "$failed self-test(s) failed" }
+        run: ./scripts/ci-selftest.ps1 -Exe src/ParaDesk.App/bin/Release/net48/ParaDesk.exe -ExpectArch x64
 
       - name: Show paradesk.log
         if: failure()
@@ -69,3 +45,43 @@ jobs:
           name: ParaDesk-net48-Release
           path: src/ParaDesk.App/bin/Release/net48
           if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ParaDesk-net48-Release-arm64
+          path: src/ParaDesk.App/bin/ARM64/Release/net48
+          if-no-files-found: error
+
+  arm64:
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build (Release, ARM64 and AnyCPU)
+        run: |
+          dotnet build src/ParaDesk.App/ParaDesk.App.csproj -c Release -nologo -p:Platform=ARM64
+          dotnet build src/ParaDesk.App/ParaDesk.App.csproj -c Release -nologo
+
+      - name: Self-tests (ARM64, native)
+        shell: pwsh
+        timeout-minutes: 10
+        run: ./scripts/ci-selftest.ps1 -Exe src/ParaDesk.App/bin/ARM64/Release/net48/ParaDesk.exe -ExpectArch arm64
+
+      - name: Self-tests (AnyCPU under x64 emulation)
+        shell: pwsh
+        timeout-minutes: 10
+        run: ./scripts/ci-selftest.ps1 -Exe src/ParaDesk.App/bin/Release/net48/ParaDesk.exe
+
+      - name: Show paradesk.log
+        if: failure()
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:LOCALAPPDATA 'ParaDesk\paradesk.log'
+          if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Tail 100 -Encoding utf8 }
+          else { Write-Host "no log at $log" }

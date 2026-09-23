@@ -15,7 +15,9 @@
     <AssemblyName>ParaDesk</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>paradesk.ico</ApplicationIcon>
-    <Platforms>AnyCPU</Platforms>
+    <!-- ARM64：dotnet build -p:Platform=ARM64，产物在 bin\ARM64\，在 Arm 设备上原生运行（需要 .NET Framework 4.8.1）；
+         AnyCPU 构建在 Arm 设备上由系统以 x64 模拟运行。 -->
+    <Platforms>AnyCPU;ARM64</Platforms>
     <Prefer32Bit>false</Prefer32Bit>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
     <Product>ParaDesk</Product>

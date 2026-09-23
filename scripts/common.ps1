@@ -40,8 +40,13 @@ function Get-ParaDeskOutputDir {
     [CmdletBinding()]
     param(
         [ValidateSet('Debug', 'Release')]
-        [string]$Configuration = 'Debug'
+        [string]$Configuration = 'Debug',
+        [ValidateSet('AnyCPU', 'ARM64')]
+        [string]$Platform = 'AnyCPU'
     )
+    if ($Platform -eq 'ARM64') {
+        return (Join-Path $ParaDeskRoot ('src\ParaDesk.App\bin\ARM64\{0}\net48' -f $Configuration))
+    }
     return (Join-Path $ParaDeskRoot ('src\ParaDesk.App\bin\{0}\net48' -f $Configuration))
 }
 
@@ -49,9 +54,21 @@ function Get-ParaDeskExe {
     [CmdletBinding()]
     param(
         [ValidateSet('Debug', 'Release')]
-        [string]$Configuration = 'Debug'
+        [string]$Configuration = 'Debug',
+        [ValidateSet('AnyCPU', 'ARM64')]
+        [string]$Platform = 'AnyCPU'
     )
-    return (Join-Path (Get-ParaDeskOutputDir -Configuration $Configuration) 'ParaDesk.exe')
+    return (Join-Path (Get-ParaDeskOutputDir -Configuration $Configuration -Platform $Platform) 'ParaDesk.exe')
+}
+
+function Get-ParaDeskBuildArgs {
+    [CmdletBinding()]
+    param(
+        [ValidateSet('AnyCPU', 'ARM64')]
+        [string]$Platform = 'AnyCPU'
+    )
+    if ($Platform -eq 'ARM64') { return @('-p:Platform=ARM64') }
+    return @()
 }
 
 function Get-ParaDeskProcess {

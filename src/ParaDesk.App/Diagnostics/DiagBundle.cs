@@ -485,6 +485,7 @@ namespace ParaDesk.Diagnostics
             sb.AppendLine("OSVersion        = " + Environment.OSVersion.VersionString);
             sb.AppendLine("Is64BitOS        = " + Environment.Is64BitOperatingSystem);
             sb.AppendLine("Is64BitProcess   = " + Environment.Is64BitProcess);
+            sb.AppendLine("Architecture     = " + PlatformInfo.Describe());
             sb.AppendLine("NetFxRelease     = " + NetFrameworkRelease());
             sb.AppendLine("CLR              = " + Environment.Version);
             sb.AppendLine("mstscax.dll      = " + FileVersionOf(Path.Combine(Environment.SystemDirectory, "mstscax.dll")));

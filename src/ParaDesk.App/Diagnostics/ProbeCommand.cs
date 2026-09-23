@@ -51,6 +51,7 @@ namespace ParaDesk.Diagnostics
 
             sb.AppendLine(string.Format(L.T("=== {0} v{1} 环境自检 ==="), AppInfo.DisplayTitle, AppInfo.Version));
             sb.AppendLine("OsBuild            = " + OsBuild());
+            sb.AppendLine("Architecture       = " + PlatformInfo.Describe());
             sb.AppendLine("EditionID          = " + r.EditionId + " (build " + r.BuildNumber + ")");
             sb.AppendLine("IsHomeEdition      = " + r.IsHomeEdition);
             sb.AppendLine("ChildSessionsOn    = " + r.ChildSessionsEnabled);
@@ -104,6 +105,9 @@ namespace ParaDesk.Diagnostics
                 NeedsSetup = r.NeedsSetup,
                 NextAction = r.NextAction,
                 WgcSupported = wgcSupported,
+                ProcessArchitecture = PlatformInfo.ProcessArchitecture,
+                OsArchitecture = PlatformInfo.OsArchitecture,
+                Emulated = PlatformInfo.IsEmulated,
                 Monitors = new List<ProbeMonitor>(),
             };
 
@@ -185,6 +189,9 @@ namespace ParaDesk.Diagnostics
             [DataMember(Name = "nextAction", Order = 19)] public string NextAction;
             [DataMember(Name = "wgcSupported", Order = 20)] public bool WgcSupported;
             [DataMember(Name = "monitors", Order = 21)] public List<ProbeMonitor> Monitors;
+            [DataMember(Name = "processArchitecture", Order = 22)] public string ProcessArchitecture;
+            [DataMember(Name = "osArchitecture", Order = 23)] public string OsArchitecture;
+            [DataMember(Name = "emulated", Order = 24)] public bool Emulated;
         }
 
         [DataContract]

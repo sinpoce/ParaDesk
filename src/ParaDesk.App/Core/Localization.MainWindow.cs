@@ -6,6 +6,9 @@ namespace ParaDesk.Core
     {
         static partial void AddMainWindow(Action<string, string> Add)
         {
+            Add("系统 {0} (build {1})　子会话 {2}　监听器 {3}　架构 {4}",
+                "{0} (build {1})　Child sessions {2}　Listener {3}　Architecture {4}");
+            Add("{0}（在 {1} 上模拟运行，建议改用 arm64 版）", "{0} (emulated on {1}; the arm64 build runs natively)");
             Add("知道了", "Got it");
             Add("来自分身桌面的提醒", "Notice from the parallel desktop");
             Add("。热键 {0}", ". Hotkey: {0}");

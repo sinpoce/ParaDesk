@@ -185,6 +185,10 @@ foreach ($flavor in $flavors) {
 
     Copy-Item -LiteralPath (Join-Path $ParaDeskRoot 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
 
+    $skillStage = Join-Path $stage 'skills\paradesk-cli'
+    New-Item -ItemType Directory -Force -Path $skillStage | Out-Null
+    Copy-Item -LiteralPath (Join-Path $ParaDeskRoot 'skills\paradesk-cli\SKILL.md') -Destination $skillStage
+
 
     $reqEn = $req[$flavor].En
     $reqZh = $req[$flavor].Zh
@@ -227,6 +231,16 @@ Command line (also works from inside the parallel desktop)
               3 ParaDesk is not running, 64 wrong arguments.
   ParaDesk.exe is a window program: in PowerShell, pipe or capture its
   output (or use Start-Process -Wait -PassThru) to get output and exit code.
+
+Agent skill (optional)
+  The self-contained English skill is in skills\paradesk-cli\SKILL.md.
+  For Codex, copy the paradesk-cli folder to %USERPROFILE%\.codex\skills
+  (or your custom CODEX_HOME\skills). Refresh the agent's skills and ask:
+  "Use the paradesk-cli skill to inspect my ParaDesk session."
+  Give the agent the full path to this package's ParaDesk.exe.
+  The CLI manages sessions and capture; clicking and typing need a
+  separately configured automation agent inside the child session.
+  More instructions: https://github.com/sinpoce/ParaDesk#agent-skill
 
 If something goes wrong
   Main window -> Diagnostics -> "Export diagnostic bundle", then attach the

@@ -70,6 +70,34 @@ PowerShell examples:
 
 `--wait` waits for Windows sign-in, up to 100 seconds. Recording, screenshots and notifications are also supported; see `--help`.
 
+## Agent skill
+
+The English, self-contained [paradesk-cli skill](skills/paradesk-cli/SKILL.md) teaches an agent to locate ParaDesk, inspect its JSON status, manage the child session, and capture or record its window. It does not install a desktop automation controller: clicking, typing, and launching apps inside the child session require a separately configured agent running there.
+
+### Install in Codex
+
+From a source checkout or a release package that includes `skills`, copy the skill folder into your Codex skills directory (use your custom `CODEX_HOME` instead of `.codex` if configured):
+
+```powershell
+$skillRoot = Join-Path $env:USERPROFILE '.codex\skills'
+New-Item -ItemType Directory -Force $skillRoot | Out-Null
+Copy-Item -Recurse '.\skills\paradesk-cli' $skillRoot
+```
+
+Alternatively, download the single [SKILL.md](https://raw.githubusercontent.com/sinpoce/ParaDesk/main/skills/paradesk-cli/SKILL.md); no other skill files are required:
+
+```powershell
+$skillDir = Join-Path $env:USERPROFILE '.codex\skills\paradesk-cli'
+New-Item -ItemType Directory -Force $skillDir | Out-Null
+Invoke-WebRequest 'https://raw.githubusercontent.com/sinpoce/ParaDesk/main/skills/paradesk-cli/SKILL.md' -OutFile (Join-Path $skillDir 'SKILL.md')
+```
+
+Review an existing installation before replacing its files. For another agent with `SKILL.md` support, copy the same folder to that agent's documented skills directory. Reopen or refresh the agent's skill list if needed, then use:
+
+> Use $paradesk-cli with ParaDesk.exe at C:\Tools\ParaDesk\ParaDesk.exe to check the child session status and record its window while I work.
+
+Replace the example executable path with your own. Complete ParaDesk's initial setup first. Future release packages built from this source include the skill under `skills/paradesk-cli`; for older downloads, use the single-file download above.
+
 ---
 
 ## 简体中文
